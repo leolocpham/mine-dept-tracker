@@ -14,8 +14,9 @@ import pandas as pd
 DATA_DIR = Path(__file__).parent.parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-_CONTRACT_FILE = DATA_DIR / "contracts.json"
-_TMM_FILE      = DATA_DIR / "tmm.json"
+_CONTRACT_FILE  = DATA_DIR / "contracts.json"
+_TMM_FILE       = DATA_DIR / "tmm.json"
+_SAP_DB_FILE    = DATA_DIR / "sap_actuals.json"
 
 # ---------------------------------------------------------------------------
 # Column schemas (defines order + dtypes for both tables)
@@ -100,3 +101,81 @@ def load_tmm() -> pd.DataFrame:
 def save_tmm(df: pd.DataFrame) -> None:
     cols = [c for c in TMM_COLS if c in df.columns]
     df[cols].to_json(_TMM_FILE, orient="records", indent=2)
+
+
+# ---------------------------------------------------------------------------
+# SAP Actuals Database
+# ---------------------------------------------------------------------------
+
+def load_sap_db() -> pd.DataFrame:
+    """
+    Load the persistent SAP actuals database.
+    Returns an empty DataFrame (not None) if no data exists yet.
+    Date column is restored to datetime.
+    """
+    if _SAP_DB_FILE.exists():
+        try:
+            df = pd.read_json(_SAP_DB_FILE, orient="records", dtype=False)
+            if df.empty:
+                return pd.DataFrame()
+            df["date"]   = pd.to_datetime(df.get("date", pd.Series(dtype=str)), errors="coerce")
+            df["amount"] = pd.to_numeric(df.get("amount", 0), errors="coerce").fillna(0.0)
+            return df
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+
+def save_sap_db(df: pd.DataFrame) -> None:
+    """Persist the SAP actuals database. Serialises datetime → ISO string."""
+    out = df.copy()
+    if "date" in out.columns and pd.api.types.is_datetime64_any_dtype(out["date"]):
+        out["date"] = out["date"].dt.strftime("%Y-%m-%d")
+    out.to_json(_SAP_DB_FILE, orient="records", indent=2, default_handler=str)
+
+
+def upsert_sap_period(
+    existing_db: pd.DataFrame,
+    new_records: pd.DataFrame,
+    year: int,
+    month: str,
+) -> pd.DataFrame:
+    """
+    Replace all records in existing_db for (year, month) with new_records.
+    If existing_db is empty, returns new_records as-is.
+    """
+    if existing_db.empty:
+        return new_records.reset_index(drop=True)
+
+    # Derive year/month from date for filtering existing rows
+    ex = existing_db.copy()
+    ex["_yr"] = ex["date"].dt.year
+    ex["_mo"] = ex["date"].dt.strftime("%B")
+    keep = ex[~((ex["_yr"] == year) & (ex["_mo"] == month))].drop(columns=["_yr", "_mo"])
+
+    return pd.concat([keep, new_records], ignore_index=True)
+
+
+def sap_period_summary(db: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return a summary of the SAP database by year + month:
+    columns = [Year, Month, Lines, Total Amount ($)]
+    Sorted chronologically.
+    """
+    if db.empty or "date" not in db.columns:
+        return pd.DataFrame(columns=["Year", "Month", "Lines", "Total Amount ($)"])
+
+    df = db.copy()
+    df["_yr"] = df["date"].dt.year
+    df["_mo"] = df["date"].dt.strftime("%B")
+    df["_mo_n"] = df["date"].dt.month
+
+    summary = (
+        df.groupby(["_yr", "_mo", "_mo_n"], as_index=False)
+        .agg(Lines=("amount", "count"), Total=("amount", "sum"))
+        .sort_values(["_yr", "_mo_n"])
+        .rename(columns={"_yr": "Year", "_mo": "Month", "Total": "Total Amount ($)"})
+        .drop(columns=["_mo_n"])
+    )
+    summary["Year"] = summary["Year"].astype(int)
+    return summary.reset_index(drop=True)

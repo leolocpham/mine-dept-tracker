@@ -20,6 +20,8 @@ from engine.metrics    import compute_burn_flags
 from utils.persistence import (
     load_contracts, save_contracts,
     load_tmm,       save_tmm,
+    load_sap_db,    save_sap_db,
+    upsert_sap_period, sap_period_summary,
     CONTRACT_COLS,  TMM_COLS,
 )
 from utils.exporter import export_reconciled_matrix
@@ -84,7 +86,8 @@ def _init_state() -> None:
     if "tmm" not in st.session_state:
         st.session_state["tmm"] = load_tmm()
     if "sap_df" not in st.session_state:
-        st.session_state["sap_df"] = None
+        # Load persistent SAP database on startup
+        st.session_state["sap_df"] = load_sap_db()
     if "sap_filename" not in st.session_state:
         st.session_state["sap_filename"] = ""
     if "sap_bytes" not in st.session_state:
@@ -198,8 +201,12 @@ with st.sidebar:
     st.markdown(f"**Spent:**  {_fmt_dollar(total_spent)}")
     total_tons = pd.to_numeric(t["tons"], errors="coerce").sum()
     st.markdown(f"**TMM Rows:** {len(t):,} | **Tons:** {total_tons:,.0f}")
-    sap_ok = st.session_state["sap_df"] is not None
-    st.markdown(f"**SAP Data:** {'✅ Loaded' if sap_ok else '⚪ Not loaded'}")
+    _sap = st.session_state["sap_df"]
+    _sap_lines = len(_sap) if (_sap is not None and not _sap.empty) else 0
+    if _sap_lines:
+        st.markdown(f"**SAP DB:** ✅ {_sap_lines:,} lines")
+    else:
+        st.markdown("**SAP DB:** ⚪ Empty")
 
 # ── Page router ───────────────────────────────────────────────────────────────
 page = st.session_state["page"]
@@ -759,119 +766,195 @@ elif page == "⛏️ TMM Tracker":
 # PAGE: 🔗 SAP Sync
 # =============================================================================
 elif page == "🔗 SAP Sync":
-    st.title("🔗 SAP Sync — Auto-Fill Amount Spent")
-    st.markdown("""
-Upload a SAP financial actuals export and the app will match PO/PR numbers against your
-Contract Tracker, automatically filling in **Amount Spent** for matched rows.
-
-**Recommended SAP report:** `KSB1` (Actual Cost Line Items by Cost Centre) — export as `.xlsx` or `.csv`.
-""")
+    st.title("🔗 SAP Data — Upload Monthly Actuals")
+    st.markdown(
+        "Upload your monthly SAP export and it will be added to the persistent database. "
+        "Cost per Ton in the TMM Tracker and Amount Spent in the Contract Tracker "
+        "are both calculated from this database."
+    )
 
     st.markdown("""
 <div class="tip-box">
-💡 <strong>How to export from SAP (KSB1):</strong><br>
-1. Open SAP → Enter transaction code <code>KSB1</code><br>
-2. Enter your Cost Centre(s) and Fiscal Year / Period<br>
-3. Click Execute (F8)<br>
-4. Go to <em>List → Export → Spreadsheet</em> → save as <code>.xlsx</code><br>
-5. Upload that file below
+💡 <strong>How to export from SAP (KSB1):</strong>
+Enter transaction <code>KSB1</code> → set your Cost Centre(s) and Period →
+Execute (F8) → List → Export → Spreadsheet → save as <code>.xlsx</code>
 </div>
 """, unsafe_allow_html=True)
 
     st.divider()
 
+    # ── Section 1: Upload new monthly file ──────────────────────────────────
+    st.markdown("### 1 · Upload Monthly File")
+
     sap_file = st.file_uploader(
-        "Upload SAP Financial Actuals (.csv / .xlsx / .xls)",
+        "Upload SAP export (.csv / .xlsx / .xls)",
         type=["csv", "xlsx", "xls"],
+        key="sap_uploader",
     )
 
-    if sap_file and sap_file.name != st.session_state["sap_filename"]:
-        st.session_state["sap_bytes"]    = sap_file.read()
-        st.session_state["sap_filename"] = sap_file.name
-
-    if st.session_state["sap_filename"]:
-        st.caption(f"✅ Loaded: {st.session_state['sap_filename']}")
-
-    if st.session_state["sap_bytes"] is not None and st.session_state["sap_df"] is None:
+    if sap_file:
+        file_bytes = sap_file.read()
         try:
-            raw = read_file(st.session_state["sap_bytes"], st.session_state["sap_filename"])
-            sap_clean, warns = clean_sap(raw)
-            st.session_state["sap_df"] = sap_clean
+            raw      = read_file(file_bytes, sap_file.name)
+            new_data, warns = clean_sap(raw)
+
             if warns:
                 with st.expander(f"⚠️ {len(warns)} column detection warning(s)"):
-                    for w in warns: st.warning(w)
+                    for w in warns:
+                        st.warning(w)
+
+            # Detect periods in the uploaded file
+            new_data = new_data[new_data["date"].notna()].copy()
+            new_data["_yr"] = new_data["date"].dt.year
+            new_data["_mo"] = new_data["date"].dt.strftime("%B")
+
+            periods_found = (
+                new_data[["_yr", "_mo"]]
+                .drop_duplicates()
+                .sort_values(["_yr", "_mo"])
+                .values.tolist()
+            )
+
+            if not periods_found:
+                st.error(
+                    "No valid posting dates found in the file. "
+                    "Check that a 'Posting Date' or 'Document Date' column exists."
+                )
+            else:
+                # Show preview
+                period_labels = [f"{mo} {yr}" for yr, mo in periods_found]
+                st.success(
+                    f"**{len(new_data):,} posting lines** detected | "
+                    f"Period(s): {', '.join(period_labels)} | "
+                    f"Total: {_fmt_dollar(new_data['amount'].sum())}"
+                )
+
+                with st.expander("Preview (first 20 rows)"):
+                    preview_cols = ["cost_center", "po_number", "pr_number",
+                                    "vendor", "amount", "date", "description"]
+                    st.dataframe(
+                        new_data[[c for c in preview_cols if c in new_data.columns]].head(20),
+                        use_container_width=True, hide_index=True,
+                    )
+
+                # Warn if these periods already exist in the DB
+                existing_db = st.session_state["sap_df"]
+                existing_summary = sap_period_summary(existing_db)
+                overlap = []
+                if not existing_summary.empty:
+                    for yr, mo in periods_found:
+                        if not existing_summary[
+                            (existing_summary["Year"] == yr) &
+                            (existing_summary["Month"] == mo)
+                        ].empty:
+                            overlap.append(f"{mo} {yr}")
+                if overlap:
+                    st.warning(
+                        f"⚠️ The database already contains data for: **{', '.join(overlap)}**. "
+                        "Confirming below will **replace** those records."
+                    )
+
+                if st.button(f"💾 Add to SAP Database ({', '.join(period_labels)})",
+                             type="primary"):
+                    new_data_clean = new_data.drop(columns=["_yr", "_mo"], errors="ignore")
+                    updated_db = existing_db.copy() if not existing_db.empty else pd.DataFrame()
+
+                    for yr, mo in periods_found:
+                        period_rows = new_data_clean[
+                            (new_data_clean["date"].dt.year == yr) &
+                            (new_data_clean["date"].dt.strftime("%B") == mo)
+                        ].copy()
+                        updated_db = upsert_sap_period(updated_db, period_rows, yr, mo)
+
+                    save_sap_db(updated_db)
+                    st.session_state["sap_df"]      = updated_db
+                    st.session_state["sap_filename"] = sap_file.name
+                    st.success(
+                        f"✅ Database updated — "
+                        f"{len(updated_db):,} total lines across all periods."
+                    )
+                    st.rerun()
+
         except Exception as exc:
-            st.error(f"Could not parse SAP file: {exc}")
+            st.error(f"Could not parse file: {exc}")
+
+    # ── Section 2: Current database ─────────────────────────────────────────
+    st.divider()
+    st.markdown("### 2 · Current SAP Database")
+
+    current_db = st.session_state["sap_df"]
+    if current_db is None or current_db.empty:
+        st.info("No SAP data in the database yet. Upload a monthly file above.")
+    else:
+        summary = sap_period_summary(current_db)
+        summary["Total Amount ($)"] = summary["Total Amount ($)"].apply(_fmt_dollar)
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+        st.caption(f"Database total: {len(current_db):,} posting lines | "
+                   f"{_fmt_dollar(current_db['amount'].sum())} cumulative")
+
+        # Delete a period
+        with st.expander("🗑️ Delete a Period from the Database"):
+            period_options = [
+                f"{row['Month']} {row['Year']}"
+                for _, row in sap_period_summary(current_db).iterrows()
+            ]
+            if period_options:
+                del_choice = st.selectbox("Select period to delete", period_options)
+                if st.button("Delete selected period", type="secondary"):
+                    parts = del_choice.split(" ", 1)
+                    del_mo, del_yr = parts[0], int(parts[1])
+                    db_copy = current_db.copy()
+                    db_copy["_yr"] = db_copy["date"].dt.year
+                    db_copy["_mo"] = db_copy["date"].dt.strftime("%B")
+                    db_copy = db_copy[
+                        ~((db_copy["_yr"] == del_yr) & (db_copy["_mo"] == del_mo))
+                    ].drop(columns=["_yr", "_mo"])
+                    save_sap_db(db_copy)
+                    st.session_state["sap_df"] = db_copy
+                    st.success(f"Deleted {del_choice} from the database.")
+                    st.rerun()
+
+    # ── Section 3: Sync to Contract Tracker ─────────────────────────────────
+    st.divider()
+    st.markdown("### 3 · Sync Amount Spent → Contract Tracker")
+    st.markdown(
+        "Match PO/PR numbers from the SAP database against your Contract Tracker "
+        "and update the **Amount Spent** column automatically."
+    )
 
     sap_df = st.session_state.get("sap_df")
-
-    if sap_df is not None:
-        st.success(f"SAP file parsed: {len(sap_df):,} posting lines | "
-                   f"Total amount: {_fmt_dollar(sap_df['amount'].sum())}")
-
-        with st.expander("Preview SAP data (first 20 rows)"):
-            st.dataframe(sap_df.head(20), use_container_width=True, hide_index=True)
-
-        st.divider()
-        if st.button("🔄 Sync Actuals → Contract Tracker"):
-            contracts_df = contracts().copy()
-            if contracts_df.empty:
-                st.warning("Your Contract Tracker is empty. Add contracts first.")
-            else:
-                # Aggregate SAP by PO (primary) or PR (fallback)
-                sap_agg = sap_df.copy()
-                sap_agg["key"] = sap_agg["po_number"].where(
-                    sap_agg["po_number"] != "", sap_agg["pr_number"]
-                )
-                sap_agg = (
-                    sap_agg[sap_agg["key"] != ""]
-                    .groupby("key", as_index=False)["amount"]
-                    .sum()
-                    .rename(columns={"amount": "sap_amount"})
-                )
-                sap_lookup = dict(zip(sap_agg["key"], sap_agg["sap_amount"]))
-
-                updated = 0
-                for idx, row in contracts_df.iterrows():
-                    key = row["po_number"] if row["po_number"].strip() else row["pr_number"]
-                    if key.strip() and key in sap_lookup:
-                        contracts_df.at[idx, "amount_spent"] = round(sap_lookup[key], 2)
-                        contracts_df.at[idx, "sap_synced"]   = True
-                        updated += 1
-
-                save_contracts(contracts_df)
-                st.session_state["contracts"] = contracts_df
-                st.success(
-                    f"✅ Synced {updated} contract row(s) from SAP. "
-                    f"{len(contracts_df) - updated} row(s) had no matching PO/PR in SAP."
-                )
-                st.rerun()
-
-        # Unmatched SAP rows
-        contracts_df = contracts()
-        contract_keys = set(contracts_df["po_number"].str.strip().tolist()) | \
-                        set(contracts_df["pr_number"].str.strip().tolist())
-        contract_keys.discard("")
-
-        sap_keys = set(
-            sap_df["po_number"].str.strip().tolist() +
-            sap_df["pr_number"].str.strip().tolist()
-        ) - {""}
-
-        orphans = sap_keys - contract_keys
-        if orphans:
-            with st.expander(f"⚠️ {len(orphans)} SAP PO/PR(s) not found in Contract Tracker"):
-                st.markdown("These postings exist in SAP but have no matching contract row. "
-                            "Add them to the Contract Tracker if they should be tracked.")
-                orphan_rows = sap_df[
-                    sap_df["po_number"].isin(orphans) | sap_df["pr_number"].isin(orphans)
-                ][["po_number", "pr_number", "vendor", "amount", "description"]].drop_duplicates()
-                st.dataframe(orphan_rows, use_container_width=True, hide_index=True)
-    else:
-        if st.session_state["sap_filename"]:
-            st.info("File loaded — click the button above to parse and preview.")
+    if sap_df is None or sap_df.empty:
+        st.info("Load SAP data first (Section 1 above).")
+    elif st.button("🔄 Sync Actuals → Contract Tracker"):
+        contracts_df = contracts().copy()
+        if contracts_df.empty:
+            st.warning("Contract Tracker is empty. Add contracts first.")
         else:
-            st.info("Upload a SAP export file above to get started.")
+            sap_agg = sap_df.copy()
+            sap_agg["key"] = sap_agg["po_number"].where(
+                sap_agg["po_number"] != "", sap_agg["pr_number"]
+            )
+            sap_lookup = (
+                sap_agg[sap_agg["key"] != ""]
+                .groupby("key")["amount"].sum()
+                .to_dict()
+            )
+
+            updated = 0
+            for idx, row in contracts_df.iterrows():
+                key = row["po_number"] if str(row["po_number"]).strip() else row["pr_number"]
+                if str(key).strip() and key in sap_lookup:
+                    contracts_df.at[idx, "amount_spent"] = round(sap_lookup[key], 2)
+                    contracts_df.at[idx, "sap_synced"]   = True
+                    updated += 1
+
+            save_contracts(contracts_df)
+            st.session_state["contracts"] = contracts_df
+            st.success(
+                f"✅ {updated} contract row(s) updated from SAP database. "
+                f"{len(contracts_df) - updated} row(s) had no matching PO/PR."
+            )
+            st.rerun()
 
 
 # =============================================================================
