@@ -221,8 +221,11 @@ def clean_cost_element_report(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]
     month_col  = _find_col(df, ["month"])
     actual_col = _find_col(df, ["actual", "actuals", "actual costs"])
     commit_col = _find_col(df, ["commitment", "commitments"])
-    low_col    = _find_col(df, ["low cost elements", "low cost element", "low"])
-    top_col    = _find_col(df, ["top cost element", "top cost elements", "top"])
+    low_col    = _find_col(df, ["low cost elements", "low cost element"])
+    mid_col    = _find_col(df, ["mid cost element", "mid cost elements"])
+    top_col    = _find_col(df, ["top cost element", "top cost elements"])
+    plan_col   = _find_col(df, ["plan", "budget plan", "planned cost"])
+    allot_col  = _find_col(df, ["allotted", "allot", "allocated"])
 
     if year_col is None or month_col is None:
         warnings.append("Cost Element Report: 'Year' or 'Month' column not found.")
@@ -249,6 +252,12 @@ def clean_cost_element_report(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]
     commitment = _to_numeric(work[commit_col]) if commit_col is not None else pd.Series(
         [0.0] * len(work), index=work.index
     )
+    plan = _to_numeric(work[plan_col]) if plan_col is not None else pd.Series(
+        [0.0] * len(work), index=work.index
+    )
+    allotted = _to_numeric(work[allot_col]) if allot_col is not None else pd.Series(
+        [0.0] * len(work), index=work.index
+    )
 
     description = (
         work[low_col].astype(str).str.strip()
@@ -257,11 +266,14 @@ def clean_cost_element_report(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]
     )
     gl_account = description.str.extract(r"^(\d+)", expand=False).fillna("")
 
-    # Top Cost Element → vendor field (cleaned of leading asterisks)
-    category = (
-        work[top_col].astype(str).str.strip().str.replace(r"^\*+\s*", "", regex=True)
-        if top_col is not None
-        else pd.Series([""] * len(work), index=work.index)
+    def _clean_label(series: pd.Series) -> pd.Series:
+        return series.astype(str).str.strip().str.replace(r"^\*+\s*", "", regex=True)
+
+    category = _clean_label(work[top_col]) if top_col is not None else pd.Series(
+        [""] * len(work), index=work.index
+    )
+    mid_category = _clean_label(work[mid_col]) if mid_col is not None else pd.Series(
+        [""] * len(work), index=work.index
     )
 
     fiscal_period = pd.Series([""] * len(work), index=work.index, dtype=str)
@@ -272,16 +284,19 @@ def clean_cost_element_report(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]
         )
 
     out = pd.DataFrame({
-        "cost_center":   "",
-        "po_number":     "",
-        "pr_number":     "",
-        "vendor":        category,
-        "amount":        amount,
-        "commitment":    commitment,
-        "date":          dates,
-        "description":   description,
-        "gl_account":    gl_account,
-        "fiscal_period": fiscal_period,
+        "cost_center":        "",
+        "po_number":          "",
+        "pr_number":          "",
+        "vendor":             category,
+        "mid_cost_element":   mid_category,
+        "amount":             amount,
+        "plan":               plan,
+        "allotted":           allotted,
+        "commitment":         commitment,
+        "date":               dates,
+        "description":        description,
+        "gl_account":         gl_account,
+        "fiscal_period":      fiscal_period,
     })
 
     # Keep only detail rows:

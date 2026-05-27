@@ -7,6 +7,7 @@ local data/ folder so data survives app restarts.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -17,6 +18,8 @@ DATA_DIR.mkdir(exist_ok=True)
 _CONTRACT_FILE  = DATA_DIR / "contracts.json"
 _TMM_FILE       = DATA_DIR / "tmm.json"
 _SAP_DB_FILE    = DATA_DIR / "sap_actuals.json"
+_DOCS_DIR       = DATA_DIR / "contract_docs"
+_DOCS_DIR.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Column schemas (defines order + dtypes for both tables)
@@ -179,3 +182,33 @@ def sap_period_summary(db: pd.DataFrame) -> pd.DataFrame:
     )
     summary["Year"] = summary["Year"].astype(int)
     return summary.reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Contract Documents
+# ---------------------------------------------------------------------------
+
+def _doc_dir(contract_key: str) -> Path:
+    safe = re.sub(r"[^\w\-]", "_", str(contract_key).strip()) or "unknown"
+    d = _DOCS_DIR / safe
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def save_contract_doc(contract_key: str, filename: str, file_bytes: bytes) -> None:
+    (_doc_dir(contract_key) / filename).write_bytes(file_bytes)
+
+
+def list_contract_docs(contract_key: str) -> list[str]:
+    d = _doc_dir(contract_key)
+    return sorted(f.name for f in d.iterdir() if f.is_file())
+
+
+def load_contract_doc(contract_key: str, filename: str) -> bytes:
+    return (_doc_dir(contract_key) / filename).read_bytes()
+
+
+def delete_contract_doc(contract_key: str, filename: str) -> None:
+    p = _doc_dir(contract_key) / filename
+    if p.exists():
+        p.unlink()

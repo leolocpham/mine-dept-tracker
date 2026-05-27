@@ -22,6 +22,8 @@ from utils.persistence import (
     load_tmm,       save_tmm,
     load_sap_db,    save_sap_db,
     upsert_sap_period, sap_period_summary,
+    save_contract_doc, list_contract_docs,
+    load_contract_doc, delete_contract_doc,
     CONTRACT_COLS,  TMM_COLS,
 )
 from utils.exporter import export_reconciled_matrix
@@ -72,6 +74,7 @@ SUB_DEPTS = [
 
 PAGES = [
     "📖 How to Use",
+    "📈 Executive Summary",
     "📊 Dashboard",
     "📋 Contract Tracker",
     "⛏️ TMM Tracker",
@@ -171,6 +174,145 @@ def _add_tmm_calcs(df: pd.DataFrame) -> pd.DataFrame:
 
 def _fmt_dollar(v: float) -> str:
     return f"${v:,.0f}"
+
+# ── SAP analytics helpers ─────────────────────────────────────────────────────
+
+def _sap_db() -> pd.DataFrame:
+    df = st.session_state.get("sap_df")
+    return df if (df is not None and not df.empty) else pd.DataFrame()
+
+def _has_plan(sap_df: pd.DataFrame) -> bool:
+    return "plan" in sap_df.columns and sap_df["plan"].abs().sum() > 0
+
+def _available_periods(sap_df: pd.DataFrame) -> list[tuple[int, str]]:
+    if sap_df.empty or "date" not in sap_df.columns:
+        return []
+    d = sap_df[sap_df["date"].notna()].copy()
+    d["_yr"]  = d["date"].dt.year
+    d["_mo"]  = d["date"].dt.strftime("%B")
+    d["_mo_n"]= d["date"].dt.month
+    rows = d[["_yr", "_mo", "_mo_n"]].drop_duplicates().sort_values(["_yr", "_mo_n"])
+    return [(int(r["_yr"]), r["_mo"]) for _, r in rows.iterrows()]
+
+def _filter_period(sap_df: pd.DataFrame, year: int, month: str) -> pd.DataFrame:
+    df = sap_df[sap_df["date"].notna()].copy()
+    return df[
+        (df["date"].dt.year == year) &
+        (df["date"].dt.strftime("%B") == month)
+    ].reset_index(drop=True)
+
+def _filter_ytd(sap_df: pd.DataFrame, year: int, through_month: str) -> pd.DataFrame:
+    mo_num = _MONTH_ORDER.get(through_month, 0) + 1
+    df = sap_df[sap_df["date"].notna()].copy()
+    return df[
+        (df["date"].dt.year == year) &
+        (df["date"].dt.month <= mo_num)
+    ].reset_index(drop=True)
+
+def _build_treemap(df: pd.DataFrame, hp: bool) -> go.Figure:
+    """3-level interactive treemap: Top → Mid → GL code. Colored by vs-plan %."""
+    hh = "mid_cost_element" in df.columns
+    ids, labels, parents, values, colors, hover = [], [], [], [], [], []
+
+    def _var_color(actual: float, plan: float) -> float:
+        if not hp or plan == 0:
+            return 0.0
+        return max(-60.0, min(60.0, (plan - actual) / plan * 100))
+
+    def _add(id_, label, parent, actual, plan, tip=""):
+        ids.append(id_); labels.append(label); parents.append(parent)
+        values.append(max(0.01, float(actual)))
+        colors.append(_var_color(float(actual), float(plan)))
+        hover.append(tip or label)
+
+    total_actual = df["amount"].sum()
+    total_plan   = df["plan"].sum() if hp else total_actual
+    _add("root", f"All Costs", "", total_actual, total_plan,
+         f"Total Actual: {_fmt_dollar(total_actual)}"
+         + (f"<br>Plan: {_fmt_dollar(total_plan)}" if hp else ""))
+
+    skipped = []
+    for top, tgrp in df.groupby("vendor"):
+        if not top or str(top) in ("0", "nan", ""):
+            continue
+        t_act = tgrp["amount"].sum()
+        if t_act <= 0:
+            skipped.append(str(top))
+            continue
+        t_plan = tgrp["plan"].sum() if hp else t_act
+        top_id = f"T|{top}"
+        _add(top_id, top, "root", t_act, t_plan,
+             f"<b>{top}</b><br>Actual: {_fmt_dollar(t_act)}"
+             + (f"<br>Plan: {_fmt_dollar(t_plan)}<br>Var: {_fmt_dollar(t_plan-t_act)}" if hp else ""))
+
+        mids = (
+            [m for m in tgrp["mid_cost_element"].unique()
+             if m and str(m) not in ("0", "nan", "")]
+            if hh else []
+        )
+
+        def _add_gl_rows(subgrp, parent_id):
+            for _, row in subgrp.iterrows():
+                act = float(row["amount"])
+                if act <= 0:
+                    continue
+                gl   = str(row.get("gl_account", ""))
+                desc = str(row.get("description", ""))[:50]
+                pln  = float(row.get("plan", act)) if hp else act
+                gl_id = f"GL|{parent_id}|{gl}"
+                _add(gl_id, desc or gl, parent_id, act, pln,
+                     f"{desc}<br>GL: {gl}<br>Actual: {_fmt_dollar(act)}"
+                     + (f"<br>Plan: {_fmt_dollar(pln)}" if hp else ""))
+
+        if mids:
+            for mid, mgrp in tgrp.groupby("mid_cost_element"):
+                if not mid or str(mid) in ("0", "nan", ""):
+                    _add_gl_rows(mgrp, top_id)
+                    continue
+                m_act  = mgrp["amount"].sum()
+                m_plan = mgrp["plan"].sum() if hp else m_act
+                mid_id = f"M|{top}|{mid}"
+                _add(mid_id, mid, top_id, m_act, m_plan,
+                     f"<b>{top} › {mid}</b><br>Actual: {_fmt_dollar(m_act)}"
+                     + (f"<br>Plan: {_fmt_dollar(m_plan)}" if hp else ""))
+                _add_gl_rows(mgrp, mid_id)
+        else:
+            _add_gl_rows(tgrp, top_id)
+
+    colorscale = [
+        [0.00, "#B71C1C"], [0.30, "#EF9A9A"],
+        [0.50, "#F5F5F5"],
+        [0.70, "#A5D6A7"], [1.00, "#1B5E20"],
+    ]
+    fig = go.Figure(go.Treemap(
+        ids=ids, labels=labels, parents=parents, values=values,
+        customdata=hover,
+        hovertemplate="%{customdata}<extra></extra>",
+        texttemplate="<b>%{label}</b>",
+        marker=dict(
+            colors=colors, colorscale=colorscale, cmid=0,
+            showscale=hp,
+            colorbar=dict(
+                title=dict(text="vs Plan %", side="right"),
+                tickformat="+.0f", ticksuffix="%",
+                len=0.6, thickness=14,
+            ),
+        ),
+        branchvalues="total",
+        maxdepth=3,
+        pathbar=dict(visible=True),
+    ))
+    fig.update_layout(
+        height=520, margin=dict(t=10, l=10, r=10, b=10),
+        paper_bgcolor="white",
+    )
+    if skipped:
+        fig.add_annotation(
+            text=f"Note: {', '.join(skipped)} excluded (net credit this period)",
+            xref="paper", yref="paper", x=0, y=-0.02,
+            showarrow=False, font=dict(size=10, color="#888"),
+        )
+    return fig
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -394,101 +536,493 @@ outstanding obligations that are not yet posted in SAP.
 
 
 # =============================================================================
-# PAGE: 📊 Dashboard
+# PAGE: 📈 Executive Summary
 # =============================================================================
-elif page == "📊 Dashboard":
-    st.title("📊 Executive Dashboard")
+elif page == "📈 Executive Summary":
+    st.title("📈 Executive Summary")
+    st.markdown("_Monthly cost performance, year-to-date tracking, and key areas of focus._")
 
-    c_df = _add_contract_calcs(contracts())
-    t_df = _add_tmm_calcs(tmm())
-
-    if c_df.empty and t_df.empty:
-        st.info("No data yet. Go to **Contract Tracker** to add contracts, or **TMM Tracker** to log material moved.")
+    sap = _sap_db()
+    if sap.empty:
+        st.info(
+            "No SAP cost data loaded yet. Upload your monthly cost element file "
+            "on the **🔗 SAP Sync** page to enable this page."
+        )
         st.stop()
 
-    # ── KPI row 1 ──
-    total_budget    = c_df["original_budget"].sum()
-    total_spent     = c_df["amount_spent"].sum()
-    total_remaining = c_df["amount_left"].sum()
-    total_tons      = t_df["tons"].sum()
-    total_tmm_cost  = t_df["total_cost"].sum()
-    overall_cpt     = (total_tmm_cost / total_tons) if total_tons > 0 else 0
-    over_count      = (c_df["amount_left"] < 0).sum()
+    periods = _available_periods(sap)
+    if not periods:
+        st.stop()
 
+    hp = _has_plan(sap)
+    period_labels = [f"{mo} {yr}" for yr, mo in periods]
+    pc, _ = st.columns([2, 5])
+    with pc:
+        sel_label = st.selectbox(
+            "Reporting Period", period_labels,
+            index=len(period_labels) - 1, key="exec_period",
+        )
+    sel_yr, sel_mo = next((yr, mo) for yr, mo in periods if f"{mo} {yr}" == sel_label)
+
+    curr        = _filter_period(sap, sel_yr, sel_mo)
+    curr_actual = curr["amount"].sum()
+    curr_plan   = curr["plan"].sum() if hp else 0
+    curr_var    = curr_plan - curr_actual
+    curr_vp     = curr_var / curr_plan * 100 if curr_plan != 0 else 0
+
+    mo_idx = _MONTH_ORDER.get(sel_mo, 0)
+    p_yr, p_mo = (sel_yr - 1, "December") if mo_idx == 0 else (sel_yr, MONTHS[mo_idx - 1])
+    prior        = _filter_period(sap, p_yr, p_mo)
+    prior_actual = prior["amount"].sum()
+    mom_chg      = curr_actual - prior_actual
+    mom_pct      = mom_chg / prior_actual * 100 if prior_actual else 0
+
+    ytd        = _filter_ytd(sap, sel_yr, sel_mo)
+    ytd_actual = ytd["amount"].sum()
+    ytd_plan   = ytd["plan"].sum() if hp else 0
+    ytd_var    = ytd_plan - ytd_actual
+    ytd_vp     = ytd_var / ytd_plan * 100 if ytd_plan != 0 else 0
+    mo_count   = _MONTH_ORDER.get(sel_mo, 0) + 1
+
+    # ── KPI row 1: current month ──────────────────────────────────────────────
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Total Budget",    _fmt_dollar(total_budget))
-    k2.metric("Total Spent",     _fmt_dollar(total_spent),
-              delta=f"{total_spent/total_budget*100:.1f}% of budget" if total_budget else None)
-    k3.metric("Total Remaining", _fmt_dollar(total_remaining),
-              delta_color="normal" if total_remaining >= 0 else "inverse",
-              delta=f"{total_remaining/total_budget*100:.1f}%" if total_budget else None)
-    k4.metric("Overall Cost / Ton",
-              f"${overall_cpt:,.2f}" if overall_cpt else "—",
-              help="Total TMM cost ÷ total tons moved across all periods")
+    k1.metric(f"Actual — {sel_mo[:3]} {sel_yr}", _fmt_dollar(curr_actual))
+    if hp:
+        k2.metric("Plan", _fmt_dollar(curr_plan))
+        k3.metric(
+            "Variance vs Plan", _fmt_dollar(curr_var),
+            delta=f"{curr_vp:+.1f}%",
+            delta_color="normal" if curr_var >= 0 else "inverse",
+            help="Positive = under plan (good). Negative = over plan.",
+        )
+    else:
+        k2.metric("Plan", "N/A — upload cost element file")
+        k3.metric("Variance", "N/A")
+    if prior_actual:
+        k4.metric(
+            f"vs {p_mo[:3]} {p_yr}", _fmt_dollar(mom_chg),
+            delta=f"{mom_pct:+.1f}%",
+            delta_color="inverse" if mom_chg > 0 else "normal",
+        )
+    else:
+        k4.metric("vs Prior Month", "—")
 
-    k5, k6, k7, k8 = st.columns(4)
-    k5.metric("Active Contracts",   f"{len(c_df):,}")
-    k6.metric("Over-Budget Contracts", f"{over_count:,}",
-              delta_color="inverse" if over_count > 0 else "normal",
-              delta="⚠️ Review needed" if over_count > 0 else "All within budget")
-    k7.metric("Total Tons Moved",   f"{total_tons:,.0f} t")
-    k8.metric("TMM Periods Logged", f"{len(t_df):,}")
+    # ── KPI row 2: YTD ───────────────────────────────────────────────────────
+    if hp:
+        y1, y2, y3, y4 = st.columns(4)
+        y1.metric(f"YTD Actual ({sel_yr})", _fmt_dollar(ytd_actual))
+        y2.metric("YTD Plan",               _fmt_dollar(ytd_plan))
+        y3.metric(
+            "YTD Variance", _fmt_dollar(ytd_var),
+            delta=f"{ytd_vp:+.1f}%",
+            delta_color="normal" if ytd_var >= 0 else "inverse",
+        )
+        y4.metric("Months in YTD", str(mo_count))
 
     st.divider()
 
-    # ── Sub-dept chart ──
-    col_chart, col_burn = st.columns([3, 2])
+    # ── Category breakdown ────────────────────────────────────────────────────
+    cat_df = (
+        curr.groupby("vendor", as_index=False)
+        .agg(actual=("amount", "sum"),
+             plan  =("plan",   "sum") if hp else ("amount", "sum"))
+    )
+    cat_df = cat_df[cat_df["actual"].abs() > 0].copy()
+    if hp:
+        cat_df["variance"] = cat_df["plan"] - cat_df["actual"]
+        cat_df["var_pct"]  = (
+            cat_df["variance"] / cat_df["plan"].replace(0, np.nan) * 100
+        ).fillna(0)
+        over_plan  = cat_df[cat_df["variance"] < 0].sort_values("variance")
+        under_plan = cat_df[cat_df["variance"] > 0].sort_values("variance", ascending=False)
+    else:
+        over_plan = under_plan = pd.DataFrame()
 
-    with col_chart:
-        st.markdown("### Budget vs Spend by Sub-Department")
-        if "sub_dept" in c_df.columns and not c_df["sub_dept"].str.strip().eq("").all():
-            grp = (
-                c_df[c_df["sub_dept"].str.strip() != ""]
-                .groupby("sub_dept", as_index=False)
-                .agg(budget=("original_budget", "sum"), spent=("amount_spent", "sum"),
-                     remaining=("amount_left", "sum"))
-                .sort_values("budget", ascending=True)
+    # ── Insight narrative ─────────────────────────────────────────────────────
+    trend_sap = (
+        sap[sap["date"].notna()].copy()
+        .assign(_yr=lambda d: d["date"].dt.year, _mo_n=lambda d: d["date"].dt.month)
+        .groupby(["_yr", "_mo_n"], as_index=False)
+        .agg(actual=("amount", "sum"))
+        .sort_values(["_yr", "_mo_n"])
+    )
+    if len(trend_sap) >= 3:
+        l = trend_sap.tail(3)["actual"].tolist()
+        trend_txt = (
+            "📈 Costs have been rising over the last 3 months."
+            if l[2] > l[1] > l[0] else
+            "📉 Costs have been declining over the last 3 months — positive trend."
+            if l[2] < l[1] < l[0] else
+            "↔️ Costs have been relatively stable over the last 3 months."
+        )
+    else:
+        trend_txt = ""
+
+    lines = []
+    if hp:
+        icon = "✅" if curr_var >= 0 else "⚠️"
+        word = "under plan" if curr_var >= 0 else "over plan"
+        lines.append(
+            f"{icon} **{sel_mo} {sel_yr}:** Total actual spend is "
+            f"**{_fmt_dollar(curr_actual)}**, **{abs(curr_vp):.1f}% {word}** "
+            f"(plan: {_fmt_dollar(curr_plan)})."
+        )
+        lines.append(
+            f"**YTD through {sel_mo} {sel_yr}:** {_fmt_dollar(ytd_actual)} actual vs "
+            f"{_fmt_dollar(ytd_plan)} plan — "
+            f"**{abs(ytd_vp):.1f}% {'under' if ytd_var >= 0 else 'over'} plan**."
+        )
+        if not over_plan.empty:
+            r = over_plan.iloc[0]
+            lines.append(
+                f"🔴 **Biggest over-plan area:** {r['vendor']} "
+                f"({_fmt_dollar(r['actual'])} actual vs {_fmt_dollar(r['plan'])} plan, "
+                f"{abs(r['var_pct']):.1f}% over plan)."
             )
-            fig = go.Figure()
-            fig.add_trace(go.Bar(
-                name="Budget", y=grp["sub_dept"], x=grp["budget"],
-                orientation="h", marker_color="#1B3A5C",
+        if not under_plan.empty:
+            r = under_plan.iloc[0]
+            lines.append(
+                f"🟢 **Best performing:** {r['vendor']} "
+                f"({abs(r['var_pct']):.1f}% under plan, "
+                f"{_fmt_dollar(r['variance'])} saving vs budget)."
+            )
+    else:
+        lines.append(
+            f"**{sel_mo} {sel_yr}:** Total actual spend is **{_fmt_dollar(curr_actual)}**."
+        )
+        lines.append(
+            f"**YTD through {sel_mo} {sel_yr}:** {_fmt_dollar(ytd_actual)} cumulative."
+        )
+    if trend_txt:
+        lines.append(trend_txt)
+    if prior_actual:
+        direction = "increased" if mom_chg > 0 else "decreased"
+        lines.append(
+            f"📅 **Month-on-month:** costs {direction} by "
+            f"{_fmt_dollar(abs(mom_chg))} ({abs(mom_pct):.1f}%) vs {p_mo} {p_yr}."
+        )
+
+    st.markdown(
+        '<div class="help-box">' + "<br>".join(lines) + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.divider()
+
+    # ── Spend chart + table ───────────────────────────────────────────────────
+    ch_col, tbl_col = st.columns([3, 2])
+
+    with ch_col:
+        st.markdown(f"### Spend by Category — {sel_mo} {sel_yr}")
+        cat_sorted = cat_df.sort_values("actual", ascending=True)
+
+        bar_colors = []
+        for _, row in cat_sorted.iterrows():
+            if hp:
+                bar_colors.append(
+                    "#C62828" if row["variance"] < 0
+                    else "#2E7D32" if row["variance"] > 0
+                    else "#C9872A"
+                )
+            else:
+                bar_colors.append("#1B3A5C")
+
+        fig_main = go.Figure()
+        if hp:
+            fig_main.add_trace(go.Bar(
+                name="Plan", y=cat_sorted["vendor"], x=cat_sorted["plan"],
+                orientation="h", marker_color="#B0BEC5", opacity=0.85,
             ))
-            fig.add_trace(go.Bar(
-                name="Spent", y=grp["sub_dept"], x=grp["spent"],
+        fig_main.add_trace(go.Bar(
+            name="Actual", y=cat_sorted["vendor"], x=cat_sorted["actual"],
+            orientation="h", marker_color=bar_colors,
+        ))
+        fig_main.update_layout(
+            barmode="overlay", height=max(320, len(cat_sorted) * 62),
+            margin=dict(l=0, r=10, t=10, b=10),
+            xaxis=dict(tickprefix="$", tickformat=",.0f",
+                       showgrid=True, gridcolor="#EEE"),
+            legend=dict(orientation="h", y=1.08),
+            plot_bgcolor="white", paper_bgcolor="white",
+            font=dict(family="Arial", size=12),
+        )
+        st.plotly_chart(fig_main, use_container_width=True)
+
+    with tbl_col:
+        st.markdown("### Performance Table")
+        disp = cat_df.sort_values("actual", ascending=False).copy()
+        disp["Actual"] = disp["actual"].apply(_fmt_dollar)
+        if hp:
+            disp["Plan"]     = disp["plan"].apply(_fmt_dollar)
+            disp["Variance"] = disp["variance"].apply(
+                lambda v: ("▲ " if v >= 0 else "▼ ") + _fmt_dollar(abs(v))
+            )
+            disp["Var %"] = disp["var_pct"].apply(lambda v: f"{v:+.1f}%")
+            out_cols = ["vendor", "Actual", "Plan", "Variance", "Var %"]
+        else:
+            out_cols = ["vendor", "Actual"]
+        st.dataframe(
+            disp[out_cols].rename(columns={"vendor": "Category"}),
+            use_container_width=True, hide_index=True,
+        )
+
+    # ── Month-on-month change ─────────────────────────────────────────────────
+    if not prior.empty:
+        st.divider()
+        st.markdown(f"### Month-on-Month Change vs {p_mo} {p_yr}")
+        prior_cat = prior.groupby("vendor", as_index=False).agg(prior=("amount", "sum"))
+        mom_df = cat_df.merge(prior_cat, on="vendor", how="outer").fillna(0)
+        mom_df["change"] = mom_df["actual"] - mom_df["prior"]
+        mom_df = mom_df.sort_values("change")
+        mom_colors = ["#C62828" if v > 0 else "#2E7D32" for v in mom_df["change"]]
+        fig_mom = go.Figure(go.Bar(
+            y=mom_df["vendor"], x=mom_df["change"],
+            orientation="h", marker_color=mom_colors,
+            text=mom_df["change"].apply(
+                lambda v: ("+" if v > 0 else "") + _fmt_dollar(v)
+            ),
+            textposition="outside",
+        ))
+        fig_mom.update_layout(
+            height=max(260, len(mom_df) * 55),
+            margin=dict(l=0, r=110, t=10, b=10),
+            xaxis=dict(tickprefix="$", tickformat=",.0f",
+                       showgrid=True, gridcolor="#EEE",
+                       zeroline=True, zerolinecolor="#555"),
+            plot_bgcolor="white", paper_bgcolor="white",
+            font=dict(family="Arial", size=12),
+            showlegend=False,
+        )
+        st.caption(
+            f"Red = cost increased vs {p_mo} {p_yr} (watch these areas). "
+            f"Green = cost decreased (improvement)."
+        )
+        st.plotly_chart(fig_mom, use_container_width=True)
+
+    # ── Areas of focus ────────────────────────────────────────────────────────
+    if hp and not over_plan.empty:
+        st.divider()
+        st.markdown("### 🎯 Areas of Focus — Over Plan")
+        cols = st.columns(min(3, len(over_plan)))
+        for i, (_, row) in enumerate(over_plan.head(3).iterrows()):
+            with cols[i]:
+                st.markdown(f"""
+<div style="background:#FDECEA;border-left:4px solid #C62828;
+padding:14px 16px;border-radius:6px;font-family:Arial;font-size:14px;">
+<strong>⚠️ {row['vendor']}</strong><br><br>
+Actual: <strong>{_fmt_dollar(row['actual'])}</strong><br>
+Plan: {_fmt_dollar(row['plan'])}<br>
+Over by: <strong style="color:#C62828">{_fmt_dollar(abs(row['variance']))}</strong>
+<span style="color:#C62828"> ({abs(row['var_pct']):.1f}%)</span>
+</div>""", unsafe_allow_html=True)
+
+    if hp and not under_plan.empty:
+        st.divider()
+        st.markdown("### ✅ Well-Performing Areas")
+        cols = st.columns(min(3, len(under_plan)))
+        for i, (_, row) in enumerate(under_plan.head(3).iterrows()):
+            with cols[i]:
+                st.markdown(f"""
+<div style="background:#E8F5E9;border-left:4px solid #2E7D32;
+padding:14px 16px;border-radius:6px;font-family:Arial;font-size:14px;">
+<strong>✅ {row['vendor']}</strong><br><br>
+Actual: <strong>{_fmt_dollar(row['actual'])}</strong><br>
+Plan: {_fmt_dollar(row['plan'])}<br>
+Under by: <strong style="color:#2E7D32">{_fmt_dollar(row['variance'])}</strong>
+<span style="color:#2E7D32"> ({abs(row['var_pct']):.1f}%)</span>
+</div>""", unsafe_allow_html=True)
+
+
+# =============================================================================
+# PAGE: 📊 Dashboard
+# =============================================================================
+elif page == "📊 Dashboard":
+    st.title("📊 Cost Explorer")
+
+    sap   = _sap_db()
+    c_df  = _add_contract_calcs(contracts())
+    t_df  = _add_tmm_calcs(tmm())
+    has_sap = not sap.empty
+    hp      = _has_plan(sap) if has_sap else False
+
+    # ── Period selector ───────────────────────────────────────────────────────
+    period_df = pd.DataFrame()
+    prior_df  = pd.DataFrame()
+    sel_yr, sel_mo, p_yr, p_mo = 0, "", 0, ""
+
+    if has_sap:
+        periods       = _available_periods(sap)
+        period_labels = [f"{mo} {yr}" for yr, mo in periods]
+        pc1, pc2, _ = st.columns([2, 3, 3])
+        with pc1:
+            sel_label = st.selectbox(
+                "Analysis Period", period_labels,
+                index=len(period_labels) - 1, key="dash_period",
+            )
+        sel_yr, sel_mo = next((yr, mo) for yr, mo in periods if f"{mo} {yr}" == sel_label)
+        period_df = _filter_period(sap, sel_yr, sel_mo)
+        mo_idx = _MONTH_ORDER.get(sel_mo, 0)
+        p_yr, p_mo = (sel_yr - 1, "December") if mo_idx == 0 else (sel_yr, MONTHS[mo_idx - 1])
+        prior_df  = _filter_period(sap, p_yr, p_mo)
+        with pc2:
+            st.markdown(
+                f"<div style='padding-top:28px;color:#666;font-size:13px;'>"
+                f"Comparing vs {p_mo} {p_yr}</div>",
+                unsafe_allow_html=True,
+            )
+
+    # ── KPI row ───────────────────────────────────────────────────────────────
+    total_tons     = t_df["tons"].sum()     if not t_df.empty else 0
+    total_tmm_cost = t_df["total_cost"].sum() if not t_df.empty else 0
+    overall_cpt    = total_tmm_cost / total_tons if total_tons > 0 else 0
+
+    if has_sap and not period_df.empty:
+        curr_act  = period_df["amount"].sum()
+        curr_pln  = period_df["plan"].sum() if hp else 0
+        prior_act = prior_df["amount"].sum() if not prior_df.empty else 0
+        mom_chg   = curr_act - prior_act
+        mom_pct   = mom_chg / prior_act * 100 if prior_act else 0
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric(
+            f"{sel_mo[:3]} {sel_yr} Actual", _fmt_dollar(curr_act),
+            delta=f"{mom_pct:+.1f}% vs {p_mo[:3]}",
+            delta_color="inverse" if mom_chg > 0 else "normal",
+        )
+        if hp:
+            var = curr_pln - curr_act
+            k2.metric("Plan", _fmt_dollar(curr_pln))
+            k3.metric(
+                "vs Plan", _fmt_dollar(var),
+                delta=f"{var/curr_pln*100:+.1f}%" if curr_pln else None,
+                delta_color="normal" if var >= 0 else "inverse",
+            )
+        else:
+            k2.metric("Plan", "—"); k3.metric("vs Plan", "—")
+        k4.metric("Cost / Ton", f"${overall_cpt:,.2f}" if overall_cpt else "—",
+                  help="From TMM Tracker")
+
+        over_count = (c_df["amount_left"] < 0).sum() if not c_df.empty else 0
+        k5, k6, k7, k8 = st.columns(4)
+        k5.metric("Active Contracts", f"{len(c_df):,}" if not c_df.empty else "0")
+        k6.metric("Over-Budget", f"{over_count:,}",
+                  delta="⚠️ Review" if over_count > 0 else "All within budget",
+                  delta_color="inverse" if over_count > 0 else "normal")
+        k7.metric("Total Tons Moved", f"{total_tons:,.0f} t")
+        k8.metric("TMM Periods", f"{len(t_df):,}" if not t_df.empty else "0")
+    else:
+        total_budget = c_df["original_budget"].sum() if not c_df.empty else 0
+        total_spent  = c_df["amount_spent"].sum()    if not c_df.empty else 0
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Total Budget",    _fmt_dollar(total_budget))
+        k2.metric("Total Spent",     _fmt_dollar(total_spent))
+        k3.metric("Remaining",       _fmt_dollar(total_budget - total_spent))
+        k4.metric("Cost / Ton",      f"${overall_cpt:,.2f}" if overall_cpt else "—")
+
+    st.divider()
+
+    # ── Treemap + Actual vs Plan ──────────────────────────────────────────────
+    if has_sap and not period_df.empty:
+        tm_col, bar_col = st.columns([3, 2])
+
+        with tm_col:
+            st.markdown("### 🗺️ Cost Breakdown — Click tiles to drill in")
+            if hp:
+                st.caption("Size = actual spend · Color: 🟢 under plan → 🔴 over plan")
+            st.plotly_chart(_build_treemap(period_df, hp), use_container_width=True)
+
+        with bar_col:
+            st.markdown("### Actual vs Plan" if hp else "### Spend by Category")
+            cat_df = (
+                period_df[period_df["amount"] > 0]
+                .groupby("vendor", as_index=False)
+                .agg(actual=("amount", "sum"),
+                     plan  =("plan",   "sum") if hp else ("amount", "sum"))
+                .sort_values("actual", ascending=True)
+            )
+            fig_bar = go.Figure()
+            if hp:
+                fig_bar.add_trace(go.Bar(
+                    name="Plan", y=cat_df["vendor"], x=cat_df["plan"],
+                    orientation="h", marker_color="#B0BEC5", opacity=0.85,
+                ))
+            fig_bar.add_trace(go.Bar(
+                name="Actual", y=cat_df["vendor"], x=cat_df["actual"],
                 orientation="h", marker_color="#C9872A",
             ))
-            fig.update_layout(
-                barmode="overlay", height=max(260, len(grp) * 70),
+            fig_bar.update_layout(
+                barmode="overlay", height=max(300, len(cat_df) * 55),
                 margin=dict(l=0, r=10, t=10, b=10),
                 xaxis=dict(tickprefix="$", tickformat=",.0f",
                            showgrid=True, gridcolor="#EEE"),
-                legend=dict(orientation="h", y=1.05),
+                legend=dict(orientation="h", y=1.08),
                 plot_bgcolor="white", paper_bgcolor="white",
                 font=dict(family="Arial", size=12),
             )
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Add Sub-Department values to your contracts to see this breakdown.")
+            st.plotly_chart(fig_bar, use_container_width=True)
 
-    with col_burn:
-        st.markdown("### 🚦 Burn Rate by Cost Centre")
+    elif not has_sap:
+        st.info(
+            "Upload SAP cost data on the **🔗 SAP Sync** page to enable the "
+            "interactive cost explorer. Contract charts appear below."
+        )
+
+    # ── Monthly trend ─────────────────────────────────────────────────────────
+    if has_sap and len(_available_periods(sap)) > 1:
+        st.divider()
+        st.markdown("### 📈 Monthly Cost Trend — Actual vs Plan")
+        trend = (
+            sap[sap["date"].notna()].copy()
+            .assign(_yr  =lambda d: d["date"].dt.year,
+                    _mo  =lambda d: d["date"].dt.strftime("%B"),
+                    _mo_n=lambda d: d["date"].dt.month)
+            .groupby(["_yr", "_mo", "_mo_n"], as_index=False)
+            .agg(actual=("amount", "sum"),
+                 plan  =("plan",   "sum") if hp else ("amount", "sum"))
+            .sort_values(["_yr", "_mo_n"])
+        )
+        trend["label"] = trend["_yr"].astype(int).astype(str) + " " + trend["_mo"]
+        fig_tr = go.Figure()
+        if hp:
+            fig_tr.add_trace(go.Bar(
+                name="Plan", x=trend["label"], y=trend["plan"],
+                marker_color="#B0BEC5", opacity=0.7,
+            ))
+        fig_tr.add_trace(go.Scatter(
+            name="Actual", x=trend["label"], y=trend["actual"],
+            mode="lines+markers",
+            line=dict(color="#C9872A", width=3),
+            marker=dict(size=8, color="#1B3A5C"),
+        ))
+        fig_tr.update_layout(
+            height=300, barmode="overlay",
+            margin=dict(l=0, r=10, t=10, b=10),
+            yaxis=dict(tickprefix="$", tickformat=",.0f",
+                       showgrid=True, gridcolor="#EEE"),
+            legend=dict(orientation="h", y=1.08),
+            plot_bgcolor="white", paper_bgcolor="white",
+            font=dict(family="Arial", size=12),
+        )
+        st.plotly_chart(fig_tr, use_container_width=True)
+
+    # ── Contract burn rate + TMM ──────────────────────────────────────────────
+    st.divider()
+    burn_col, tmm_col = st.columns(2)
+
+    with burn_col:
+        st.markdown("### 🚦 Contract Burn Rate")
         if not c_df.empty and c_df["cost_center"].str.strip().ne("").any():
             burn = compute_burn_flags(c_df.rename(columns={
                 "original_budget": "phased_budget",
                 "amount_spent":    "sap_posted_amount",
                 "amount_left":     "remaining_budget",
             }))
-
             def _flag_style(val: str) -> str:
                 if "Red"    in val: return "color:#C62828;font-weight:bold;"
                 if "Yellow" in val: return "color:#F57C00;font-weight:bold;"
                 return "color:#2E7D32;font-weight:bold;"
-
             burn_disp = burn[["cost_center", "burn_rate_pct", "status"]].rename(columns={
-                "cost_center":   "Cost Center",
-                "burn_rate_pct": "Burn %",
-                "status":        "Status",
+                "cost_center": "Cost Center", "burn_rate_pct": "Burn %", "status": "Status",
             })
             burn_disp["Burn %"] = burn_disp["Burn %"].apply(lambda v: f"{v:.1f}%")
             st.dataframe(
@@ -496,51 +1030,85 @@ elif page == "📊 Dashboard":
                 use_container_width=True, hide_index=True,
             )
         else:
-            st.info("Add Cost Centre values to see burn rate flags.")
+            st.info("Add Cost Centre values to contracts to see burn rate flags.")
 
-    st.divider()
-
-    # ── TMM Cost per Ton trend ──
-    st.markdown("### ⛏️ Cost per Ton Trend")
-    if t_df.empty or t_df["tons"].sum() == 0:
-        st.info("No TMM data yet. Go to **TMM Tracker** to add entries.")
-    else:
-        t_plot = t_df[t_df["tons"] > 0].copy()
-        t_plot["_mo"] = t_plot["month"].map(_MONTH_ORDER).fillna(0)
-        t_plot = t_plot.sort_values(["year", "_mo"]).drop(columns=["_mo"])
-        t_plot["period_label"] = t_plot["year"].astype(int).astype(str) + " " + t_plot["month"]
-        fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(
-            x=t_plot["period_label"],
-            y=t_plot["cost_per_ton"],
-            mode="lines+markers+text",
-            text=t_plot["cost_per_ton"].apply(lambda v: f"${v:,.2f}" if v else ""),
-            textposition="top center",
-            line=dict(color="#C9872A", width=3),
-            marker=dict(size=8, color="#1B3A5C"),
-            name="Cost / Ton",
-        ))
-        if len(t_plot) > 1:
-            avg = t_plot["cost_per_ton"].mean()
-            fig2.add_hline(
-                y=avg, line_dash="dot", line_color="#888",
-                annotation_text=f"Avg ${avg:,.2f}/t",
-                annotation_position="bottom right",
+        # Sub-dept budget chart
+        if not c_df.empty and "sub_dept" in c_df.columns and c_df["sub_dept"].str.strip().ne("").any():
+            st.markdown("#### Budget vs Spend by Sub-Dept")
+            grp = (
+                c_df[c_df["sub_dept"].str.strip() != ""]
+                .groupby("sub_dept", as_index=False)
+                .agg(budget=("original_budget", "sum"), spent=("amount_spent", "sum"))
+                .sort_values("budget", ascending=True)
             )
-        fig2.update_layout(
-            height=300, margin=dict(l=0, r=10, t=20, b=10),
-            yaxis=dict(tickprefix="$", tickformat=",.2f"),
-            plot_bgcolor="white", paper_bgcolor="white",
-            font=dict(family="Arial", size=12),
-        )
-        st.plotly_chart(fig2, use_container_width=True)
+            fig_sub = go.Figure()
+            fig_sub.add_trace(go.Bar(
+                name="Budget", y=grp["sub_dept"], x=grp["budget"],
+                orientation="h", marker_color="#1B3A5C",
+            ))
+            fig_sub.add_trace(go.Bar(
+                name="Spent", y=grp["sub_dept"], x=grp["spent"],
+                orientation="h", marker_color="#C9872A",
+            ))
+            fig_sub.update_layout(
+                barmode="overlay", height=max(200, len(grp) * 55),
+                margin=dict(l=0, r=10, t=10, b=10),
+                xaxis=dict(tickprefix="$", tickformat=",.0f",
+                           showgrid=True, gridcolor="#EEE"),
+                legend=dict(orientation="h", y=1.08),
+                plot_bgcolor="white", paper_bgcolor="white",
+                font=dict(family="Arial", size=11),
+            )
+            st.plotly_chart(fig_sub, use_container_width=True)
 
-        # TMM summary row
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Tons Moved",     f"{t_df['tons'].sum():,.0f} t")
-        m2.metric("Total TMM Cost",       _fmt_dollar(t_df["total_cost"].sum()))
-        m3.metric("Avg Cost / Ton",       f"${t_df[t_df['tons']>0]['cost_per_ton'].mean():,.2f}" if not t_df[t_df['tons']>0].empty else "—")
-        m4.metric("Best Period Cost/Ton", f"${t_df[t_df['cost_per_ton']>0]['cost_per_ton'].min():,.2f}" if not t_df[t_df['cost_per_ton']>0].empty else "—")
+    with tmm_col:
+        st.markdown("### ⛏️ Cost per Ton Trend")
+        if not t_df.empty and t_df["tons"].sum() > 0:
+            t_plot = t_df[t_df["tons"] > 0].copy()
+            t_plot["_mo"] = t_plot["month"].map(_MONTH_ORDER).fillna(0)
+            t_plot = t_plot.sort_values(["year", "_mo"])
+            t_plot["period_label"] = (
+                t_plot["year"].astype(int).astype(str) + " " + t_plot["month"]
+            )
+            fig_tmm = go.Figure()
+            fig_tmm.add_trace(go.Bar(
+                name="Tons", x=t_plot["period_label"], y=t_plot["tons"],
+                marker_color="#B0BEC5", opacity=0.7, yaxis="y",
+            ))
+            fig_tmm.add_trace(go.Scatter(
+                name="Cost/Ton", x=t_plot["period_label"], y=t_plot["cost_per_ton"],
+                mode="lines+markers",
+                line=dict(color="#C9872A", width=3),
+                marker=dict(size=8, color="#1B3A5C"),
+                yaxis="y2",
+            ))
+            if len(t_plot) > 1:
+                avg = t_plot["cost_per_ton"].mean()
+                fig_tmm.add_hline(
+                    y=avg, line_dash="dot", line_color="#888",
+                    annotation_text=f"Avg ${avg:,.2f}/t",
+                    annotation_position="bottom right",
+                    yref="y2",
+                )
+            fig_tmm.update_layout(
+                height=340,
+                yaxis =dict(title="Tons",     tickformat=",.0f",  showgrid=True, gridcolor="#EEE"),
+                yaxis2=dict(title="$/ton",    tickprefix="$", tickformat=",.2f",
+                            overlaying="y", side="right"),
+                legend=dict(orientation="h", y=1.08),
+                margin=dict(l=0, r=10, t=10, b=10),
+                plot_bgcolor="white", paper_bgcolor="white",
+                font=dict(family="Arial", size=12),
+            )
+            st.plotly_chart(fig_tmm, use_container_width=True)
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Tons", f"{t_df['tons'].sum():,.0f} t")
+            m2.metric("Avg $/Ton",  f"${t_df[t_df['tons']>0]['cost_per_ton'].mean():,.2f}"
+                      if not t_df[t_df['tons']>0].empty else "—")
+            m3.metric("Best $/Ton", f"${t_df[t_df['cost_per_ton']>0]['cost_per_ton'].min():,.2f}"
+                      if not t_df[t_df['cost_per_ton']>0].empty else "—")
+        else:
+            st.info("Add TMM data on the **TMM Tracker** page to see cost per ton trend.")
 
 
 # =============================================================================
@@ -647,6 +1215,78 @@ elif page == "📋 Contract Tracker":
             for col in ("Budget", "Spent", "Remaining"):
                 grp[col] = grp[col].apply(_fmt_dollar)
             st.dataframe(grp, use_container_width=True, hide_index=True)
+
+    # ── Contract Documents ────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### 📎 Contract Documents")
+    st.markdown(
+        "Attach PDFs, Excel files, or any supporting documents to individual "
+        "contracts. Files are saved locally and survive app restarts."
+    )
+
+    cont_df = contracts()
+    if cont_df.empty:
+        st.info("Add contracts above before attaching documents.")
+    else:
+        def _contract_label(row: pd.Series) -> str:
+            vendor = str(row.get("vendor", "")).strip()
+            task   = str(row.get("task",   "")).strip()
+            ref    = str(row.get("po_number", "")).strip() or str(row.get("pr_number", "")).strip()
+            parts  = [p for p in [vendor, task] if p]
+            if ref:
+                parts.append(f"({ref})")
+            return " — ".join(parts) if parts else f"Contract #{row.name}"
+
+        contract_map = {
+            _contract_label(row): (
+                str(row.get("po_number", "")).strip()
+                or str(row.get("pr_number", "")).strip()
+                or f"row_{idx}"
+            )
+            for idx, row in cont_df.iterrows()
+        }
+
+        dc1, dc2 = st.columns([2, 3])
+        with dc1:
+            sel_contract = st.selectbox(
+                "Select contract", list(contract_map.keys()), key="doc_contract_sel"
+            )
+            contract_key = contract_map[sel_contract]
+
+        with dc2:
+            uploaded_docs = st.file_uploader(
+                "Upload documents (multiple files OK)",
+                type=["pdf", "xlsx", "xls", "docx", "doc",
+                      "png", "jpg", "jpeg", "csv", "txt", "pptx"],
+                accept_multiple_files=True,
+                key=f"doc_upload_{contract_key}",
+            )
+            if uploaded_docs:
+                for f in uploaded_docs:
+                    save_contract_doc(contract_key, f.name, f.read())
+                st.success(f"Saved {len(uploaded_docs)} file(s) to **{sel_contract}**.")
+                st.rerun()
+
+        existing_docs = list_contract_docs(contract_key)
+        if existing_docs:
+            st.markdown(f"**Attached to:** {sel_contract}")
+            for fname in existing_docs:
+                fc1, fc2, fc3 = st.columns([5, 1, 1])
+                with fc1:
+                    st.markdown(f"📄 `{fname}`")
+                with fc2:
+                    doc_bytes = load_contract_doc(contract_key, fname)
+                    st.download_button(
+                        "⬇️", data=doc_bytes, file_name=fname,
+                        key=f"dl_{contract_key}_{fname}",
+                    )
+                with fc3:
+                    if st.button("🗑️", key=f"del_{contract_key}_{fname}",
+                                 help=f"Delete {fname}"):
+                        delete_contract_doc(contract_key, fname)
+                        st.rerun()
+        else:
+            st.caption(f"No documents attached to **{sel_contract}** yet.")
 
 
 # =============================================================================
