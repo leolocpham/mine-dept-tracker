@@ -84,7 +84,7 @@ OPS_ALIASES: dict[str, list[str]] = {
 
 def _find_col(df: pd.DataFrame, aliases: list[str]) -> Optional[str]:
     """Return the first df column that matches any alias (case-insensitive)."""
-    lookup = {c.lower().strip(): c for c in df.columns}
+    lookup = {str(c).lower().strip(): c for c in df.columns}
     for alias in aliases:
         if alias.lower() in lookup:
             return lookup[alias.lower()]
@@ -190,6 +190,111 @@ def clean_sap(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         "gl_account":    get("gl_account").astype(str).str.strip(),
         "fiscal_period": get("fiscal_period").astype(str).str.strip(),
     })
+
+    return out, warnings
+
+
+def is_cost_element_report(df: pd.DataFrame) -> bool:
+    """
+    Return True if the DataFrame looks like a cost-element summary report
+    (has Year, Month, Actual columns) rather than a PO/PR line-item extract.
+    """
+    cols = [str(c).lower().strip() for c in df.columns]
+    has_year   = any(c == "year"   for c in cols)
+    has_month  = any(c == "month"  for c in cols)
+    has_actual = any("actual" in c for c in cols)
+    has_elem   = any("cost element" in c for c in cols)
+    return has_year and has_month and (has_actual or has_elem)
+
+
+def clean_cost_element_report(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Normalise a cost-element summary report (Year / Month / Top Cost Element /
+    Low Cost Elements / Actual columns) into the standard SAP internal schema.
+
+    Dates are synthesised as the 1st of the reported Year + Month so the
+    existing _sap_monthly_costs() aggregation works unchanged.
+    """
+    warnings: list[str] = []
+
+    year_col   = _find_col(df, ["year"])
+    month_col  = _find_col(df, ["month"])
+    actual_col = _find_col(df, ["actual", "actuals", "actual costs"])
+    commit_col = _find_col(df, ["commitment", "commitments"])
+    low_col    = _find_col(df, ["low cost elements", "low cost element", "low"])
+    top_col    = _find_col(df, ["top cost element", "top cost elements", "top"])
+
+    if year_col is None or month_col is None:
+        warnings.append("Cost Element Report: 'Year' or 'Month' column not found.")
+        return pd.DataFrame(), warnings
+    if actual_col is None:
+        warnings.append("Cost Element Report: 'Actual' column not found.")
+        return pd.DataFrame(), warnings
+
+    work   = df.copy()
+    year_s = pd.to_numeric(work[year_col],  errors="coerce")
+    month_s = pd.to_numeric(work[month_col], errors="coerce")
+    valid  = year_s.notna() & month_s.notna() & month_s.between(1, 12)
+
+    # Build first-of-month dates
+    dates = pd.Series(pd.NaT, index=work.index, dtype="datetime64[ns]")
+    if valid.any():
+        dates[valid] = pd.to_datetime({
+            "year":  year_s[valid].astype(int),
+            "month": month_s[valid].astype(int),
+            "day":   1,
+        })
+
+    amount     = _to_numeric(work[actual_col])
+    commitment = _to_numeric(work[commit_col]) if commit_col is not None else pd.Series(
+        [0.0] * len(work), index=work.index
+    )
+
+    description = (
+        work[low_col].astype(str).str.strip()
+        if low_col is not None
+        else pd.Series([""] * len(work), index=work.index)
+    )
+    gl_account = description.str.extract(r"^(\d+)", expand=False).fillna("")
+
+    # Top Cost Element → vendor field (cleaned of leading asterisks)
+    category = (
+        work[top_col].astype(str).str.strip().str.replace(r"^\*+\s*", "", regex=True)
+        if top_col is not None
+        else pd.Series([""] * len(work), index=work.index)
+    )
+
+    fiscal_period = pd.Series([""] * len(work), index=work.index, dtype=str)
+    if valid.any():
+        fiscal_period[valid] = (
+            month_s[valid].astype(int).apply(lambda m: f"{m:02d}")
+            + "/" + year_s[valid].astype(int).astype(str)
+        )
+
+    out = pd.DataFrame({
+        "cost_center":   "",
+        "po_number":     "",
+        "pr_number":     "",
+        "vendor":        category,
+        "amount":        amount,
+        "commitment":    commitment,
+        "date":          dates,
+        "description":   description,
+        "gl_account":    gl_account,
+        "fiscal_period": fiscal_period,
+    })
+
+    # Keep only detail rows:
+    # - valid date and non-zero amount
+    # - description must start with a GL code (digit) — excludes subtotal rows like "* Salary Total"
+    # - no DELETE markers in description or vendor hierarchy
+    out = out[
+        out["date"].notna()
+        & (out["amount"] != 0)
+        & (out["gl_account"] != "")
+        & ~out["description"].str.upper().str.contains("DELETE", na=False)
+        & ~out["vendor"].str.upper().str.contains("DELETE", na=False)
+    ].reset_index(drop=True)
 
     return out, warnings
 

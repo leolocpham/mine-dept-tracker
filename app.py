@@ -15,7 +15,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from engine.cleaner    import read_file, clean_sap
+from engine.cleaner    import read_file, clean_sap, is_cost_element_report, clean_cost_element_report
 from engine.metrics    import compute_burn_flags
 from utils.persistence import (
     load_contracts, save_contracts,
@@ -795,85 +795,112 @@ Execute (F8) → List → Export → Spreadsheet → save as <code>.xlsx</code>
     if sap_file:
         file_bytes = sap_file.read()
         try:
-            raw      = read_file(file_bytes, sap_file.name)
-            new_data, warns = clean_sap(raw)
+            raw = read_file(file_bytes, sap_file.name)
+
+            # Auto-detect format: cost-element summary vs PO/PR line-item extract
+            if is_cost_element_report(raw):
+                new_data, warns = clean_cost_element_report(raw)
+                fmt_label = "📊 Cost Element Report"
+                preview_cols = ["vendor", "gl_account", "description", "amount",
+                                "commitment", "date", "fiscal_period"]
+                fmt_note = (
+                    "Cost element format detected — **TMM Cost/Ton will populate** from this data. "
+                    "PO/PR matching (Section 3) is not available for this format."
+                )
+            else:
+                new_data, warns = clean_sap(raw)
+                fmt_label = "📋 PO/PR Line-Item Extract"
+                preview_cols = ["cost_center", "po_number", "pr_number",
+                                "vendor", "amount", "date", "description"]
+                fmt_note = (
+                    "PO/PR line-item format detected — **SAP Sync to Contract Tracker** (Section 3) "
+                    "is available for this format."
+                )
+
+            st.info(f"**Format detected:** {fmt_label} — {fmt_note}")
 
             if warns:
                 with st.expander(f"⚠️ {len(warns)} column detection warning(s)"):
                     for w in warns:
                         st.warning(w)
 
-            # Detect periods in the uploaded file
-            new_data = new_data[new_data["date"].notna()].copy()
-            new_data["_yr"] = new_data["date"].dt.year
-            new_data["_mo"] = new_data["date"].dt.strftime("%B")
-
-            periods_found = (
-                new_data[["_yr", "_mo"]]
-                .drop_duplicates()
-                .sort_values(["_yr", "_mo"])
-                .values.tolist()
-            )
-
-            if not periods_found:
-                st.error(
-                    "No valid posting dates found in the file. "
-                    "Check that a 'Posting Date' or 'Document Date' column exists."
-                )
+            if new_data.empty:
+                st.error("No valid data rows found after cleaning. Check column detection warnings above.")
             else:
-                # Show preview
-                period_labels = [f"{mo} {yr}" for yr, mo in periods_found]
-                st.success(
-                    f"**{len(new_data):,} posting lines** detected | "
-                    f"Period(s): {', '.join(period_labels)} | "
-                    f"Total: {_fmt_dollar(new_data['amount'].sum())}"
+                # Detect periods in the uploaded file
+                new_data = new_data[new_data["date"].notna()].copy()
+                new_data["_yr"] = new_data["date"].dt.year
+                new_data["_mo"] = new_data["date"].dt.strftime("%B")
+
+                periods_found = (
+                    new_data[["_yr", "_mo"]]
+                    .drop_duplicates()
+                    .sort_values(["_yr", "_mo"])
+                    .values.tolist()
                 )
 
-                with st.expander("Preview (first 20 rows)"):
-                    preview_cols = ["cost_center", "po_number", "pr_number",
-                                    "vendor", "amount", "date", "description"]
-                    st.dataframe(
-                        new_data[[c for c in preview_cols if c in new_data.columns]].head(20),
-                        use_container_width=True, hide_index=True,
+                if not periods_found:
+                    st.error(
+                        "No valid posting dates found in the file. "
+                        "Check that a 'Posting Date', 'Document Date', or 'Year'+'Month' column exists."
                     )
-
-                # Warn if these periods already exist in the DB
-                existing_db = st.session_state["sap_df"]
-                existing_summary = sap_period_summary(existing_db)
-                overlap = []
-                if not existing_summary.empty:
-                    for yr, mo in periods_found:
-                        if not existing_summary[
-                            (existing_summary["Year"] == yr) &
-                            (existing_summary["Month"] == mo)
-                        ].empty:
-                            overlap.append(f"{mo} {yr}")
-                if overlap:
-                    st.warning(
-                        f"⚠️ The database already contains data for: **{', '.join(overlap)}**. "
-                        "Confirming below will **replace** those records."
-                    )
-
-                if st.button(f"💾 Add to SAP Database ({', '.join(period_labels)})",
-                             type="primary"):
-                    new_data_clean = new_data.drop(columns=["_yr", "_mo"], errors="ignore")
-                    updated_db = existing_db.copy() if not existing_db.empty else pd.DataFrame()
-
-                    for yr, mo in periods_found:
-                        period_rows = new_data_clean[
-                            (new_data_clean["date"].dt.year == yr) &
-                            (new_data_clean["date"].dt.strftime("%B") == mo)
-                        ].copy()
-                        updated_db = upsert_sap_period(updated_db, period_rows, yr, mo)
-
-                    save_sap_db(updated_db)
-                    st.session_state["sap_df"]      = updated_db
-                    st.session_state["sap_filename"] = sap_file.name
+                else:
+                    period_labels = [f"{mo} {int(yr)}" for yr, mo in periods_found]
                     st.success(
-                        f"✅ Database updated — "
-                        f"{len(updated_db):,} total lines across all periods."
+                        f"**{len(new_data):,} lines** detected | "
+                        f"**{len(period_labels)} period(s):** {', '.join(period_labels[:6])}"
+                        + (" …" if len(period_labels) > 6 else "")
+                        + f" | **Total: {_fmt_dollar(new_data['amount'].sum())}**"
                     )
-                    st.rerun()
+
+                    with st.expander("Preview (first 20 rows)"):
+                        st.dataframe(
+                            new_data[[c for c in preview_cols if c in new_data.columns]].head(20),
+                            use_container_width=True, hide_index=True,
+                        )
+
+                    # Warn if these periods already exist in the DB
+                    existing_db = st.session_state["sap_df"]
+                    existing_summary = sap_period_summary(existing_db)
+                    overlap = []
+                    if not existing_summary.empty:
+                        for yr, mo in periods_found:
+                            if not existing_summary[
+                                (existing_summary["Year"] == yr) &
+                                (existing_summary["Month"] == mo)
+                            ].empty:
+                                overlap.append(f"{mo} {int(yr)}")
+                    if overlap:
+                        st.warning(
+                            f"⚠️ The database already contains data for: **{', '.join(overlap[:6])}**"
+                            + (" …" if len(overlap) > 6 else "")
+                            + ". Confirming below will **replace** those records."
+                        )
+
+                    btn_label = (
+                        f"💾 Add to SAP Database ({len(period_labels)} period(s))"
+                        if len(period_labels) > 3
+                        else f"💾 Add to SAP Database ({', '.join(period_labels)})"
+                    )
+                    if st.button(btn_label, type="primary"):
+                        new_data_clean = new_data.drop(columns=["_yr", "_mo"], errors="ignore")
+                        updated_db = existing_db.copy() if not existing_db.empty else pd.DataFrame()
+
+                        for yr, mo in periods_found:
+                            period_rows = new_data_clean[
+                                (new_data_clean["date"].dt.year == yr) &
+                                (new_data_clean["date"].dt.strftime("%B") == mo)
+                            ].copy()
+                            updated_db = upsert_sap_period(updated_db, period_rows, int(yr), mo)
+
+                        save_sap_db(updated_db)
+                        st.session_state["sap_df"]      = updated_db
+                        st.session_state["sap_filename"] = sap_file.name
+                        st.success(
+                            f"✅ Database updated — "
+                            f"{len(updated_db):,} total lines across all periods."
+                        )
+                        st.rerun()
 
         except Exception as exc:
             st.error(f"Could not parse file: {exc}")
