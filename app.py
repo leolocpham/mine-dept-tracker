@@ -122,11 +122,43 @@ def _add_contract_calcs(df: pd.DataFrame) -> pd.DataFrame:
     out["status"] = out.apply(_status, axis=1)
     return out
 
+MONTHS = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+_MONTH_ORDER = {m: i for i, m in enumerate(MONTHS)}
+
+
+def _sap_monthly_costs(sap_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate SAP posted amounts by calendar year + month name."""
+    df = sap_df[sap_df["date"].notna()].copy()
+    df["year"]  = df["date"].dt.year.astype(float)
+    df["month"] = df["date"].dt.strftime("%B")   # "January" … "December"
+    return (
+        df.groupby(["year", "month"], as_index=False)["amount"]
+        .sum()
+        .rename(columns={"amount": "sap_cost"})
+    )
+
+
 def _add_tmm_calcs(df: pd.DataFrame) -> pd.DataFrame:
-    """Append cost_per_ton to the TMM table."""
+    """
+    Append total_cost (from SAP actuals) and cost_per_ton to the TMM table.
+    If no SAP data is loaded, total_cost is shown as 0.
+    """
     out = df.copy()
-    out["tons"]       = pd.to_numeric(out["tons"],       errors="coerce").fillna(0)
-    out["total_cost"] = pd.to_numeric(out["total_cost"], errors="coerce").fillna(0)
+    out["tons"] = pd.to_numeric(out["tons"], errors="coerce").fillna(0)
+    out["year"] = pd.to_numeric(out["year"], errors="coerce").fillna(0).astype(float)
+
+    sap_df = st.session_state.get("sap_df")
+    if sap_df is not None and not sap_df.empty and "date" in sap_df.columns:
+        sap_costs = _sap_monthly_costs(sap_df)
+        out = out.merge(sap_costs, on=["year", "month"], how="left")
+        out["total_cost"] = out["sap_cost"].fillna(0)
+        out = out.drop(columns=["sap_cost"], errors="ignore")
+    else:
+        out["total_cost"] = 0.0
+
     out["cost_per_ton"] = np.where(
         out["tons"] > 0,
         (out["total_cost"] / out["tons"]).round(2),
@@ -234,25 +266,23 @@ To delete a row, select it and press the <strong>Delete</strong> key or use the 
         st.markdown("""
 Go to **⛏️ TMM Tracker** in the sidebar.
 
-1. Click **+ Add row** to insert a new period entry.
-2. Fill in:
+1. Click **+ Add row** to insert a new entry — one row per month.
+2. Fill in only these fields:
 
 | Column | What to Enter |
 |---|---|
-| **Period** | Month/period label — e.g. "Jan 2025" or "Week 12" |
-| **Area / Pit** | Optional — split by pit or area if needed |
-| **Tons Moved** | Total tonnes moved for that period |
-| **Total Cost ($)** | Total operational cost for that period |
-| **Notes** | Comments (e.g. delays, overrides) |
+| **Year** | The calendar year — e.g. `2025` |
+| **Month** | Select the month from the dropdown |
+| **Tons Moved** | Total tonnes moved that month |
 
-3. **Cost per Ton** is calculated automatically.
-4. The Dashboard shows trend charts and cumulative KPIs.
-5. Click **💾 Save Changes** after editing.
+3. **Total Cost ($)** and **Cost per Ton** are **read-only — calculated automatically from SAP data**.
+   Upload your SAP actuals on the **SAP Sync** page and the app matches costs by posting date.
+4. Click **💾 Save Changes** after editing.
 
 <div class="tip-box">
-💡 <strong>Cost per Ton tip:</strong> For Total Cost, use the sum of all relevant contract spend
-for that period. You can also use the <em>Overall Cost per Ton</em> metric on the Dashboard,
-which divides total committed contract spend by total TMM automatically.
+💡 <strong>How cost is linked:</strong> The app sums all SAP posting amounts whose Posting Date
+falls in the selected Year + Month, then divides by Tons Moved to produce Cost per Ton.
+Cost columns show 0 until SAP data is uploaded on the <strong>SAP Sync</strong> page.
 </div>
 """, unsafe_allow_html=True)
 
@@ -469,12 +499,15 @@ elif page == "📊 Dashboard":
         st.info("No TMM data yet. Go to **TMM Tracker** to add entries.")
     else:
         t_plot = t_df[t_df["tons"] > 0].copy()
+        t_plot["_mo"] = t_plot["month"].map(_MONTH_ORDER).fillna(0)
+        t_plot = t_plot.sort_values(["year", "_mo"]).drop(columns=["_mo"])
+        t_plot["period_label"] = t_plot["year"].astype(int).astype(str) + " " + t_plot["month"]
         fig2 = go.Figure()
         fig2.add_trace(go.Scatter(
-            x=t_plot["period"],
+            x=t_plot["period_label"],
             y=t_plot["cost_per_ton"],
             mode="lines+markers+text",
-            text=t_plot["cost_per_ton"].apply(lambda v: f"${v:,.2f}"),
+            text=t_plot["cost_per_ton"].apply(lambda v: f"${v:,.2f}" if v else ""),
             textposition="top center",
             line=dict(color="#C9872A", width=3),
             marker=dict(size=8, color="#1B3A5C"),
@@ -615,26 +648,41 @@ elif page == "📋 Contract Tracker":
 elif page == "⛏️ TMM Tracker":
     st.title("⛏️ TMM Tracker — Total Material Moved")
     st.markdown(
-        "Log tonnes moved each period. **Cost per Ton** is calculated automatically. "
-        "Click **+ Add row** to insert a new period, then **💾 Save Changes**."
+        "Enter **Year**, **Month**, and **Tons Moved** for each period. "
+        "**Total Cost** and **Cost per Ton** are calculated automatically from SAP data. "
+        "Click **💾 Save Changes** when done."
     )
 
-    raw_tmm = tmm().copy()
+    sap_loaded = st.session_state.get("sap_df") is not None
+    if not sap_loaded:
+        st.info(
+            "💡 SAP data not loaded — Cost per Ton will show 0. "
+            "Go to **SAP Sync** to upload actuals and cost columns will populate automatically."
+        )
+
+    raw_tmm   = tmm().copy()
     display_tmm = _add_tmm_calcs(raw_tmm)
 
     col_cfg_tmm = {
-        "period":       st.column_config.TextColumn("Period",
-                        width=130, help="e.g. 'Jan 2025' or 'Week 12'"),
-        "area":         st.column_config.TextColumn("Area / Pit",
-                        width=150, help="Optional — e.g. 'Pit 1 North'"),
-        "tons":         st.column_config.NumberColumn("Tons Moved",
-                        format="%.0f t", min_value=0, width=140),
-        "total_cost":   st.column_config.NumberColumn("Total Cost ($)",
-                        format="$%.0f", min_value=0, width=150,
-                        help="Total operational cost for this period"),
-        "cost_per_ton": st.column_config.NumberColumn("Cost / Ton ($)",
-                        format="$%.2f", disabled=True, width=130),
-        "notes":        st.column_config.TextColumn("Notes", width=250),
+        "year":  st.column_config.NumberColumn(
+            "Year", format="%.0f", min_value=2000, max_value=2100,
+            width=90, help="Calendar year — e.g. 2025",
+        ),
+        "month": st.column_config.SelectboxColumn(
+            "Month", options=MONTHS, width=130,
+        ),
+        "tons":  st.column_config.NumberColumn(
+            "Tons Moved", format="%.0f t", min_value=0, width=150,
+        ),
+        # Read-only — sourced from SAP
+        "total_cost":   st.column_config.NumberColumn(
+            "SAP Cost ($)", format="$%.0f", disabled=True, width=140,
+            help="Summed from SAP posting amounts for this Year + Month",
+        ),
+        "cost_per_ton": st.column_config.NumberColumn(
+            "Cost / Ton ($)", format="$%.2f", disabled=True, width=140,
+            help="SAP Cost ÷ Tons Moved",
+        ),
     }
 
     edited_tmm = st.data_editor(
@@ -644,7 +692,8 @@ elif page == "⛏️ TMM Tracker":
         use_container_width=True,
         hide_index=True,
         key="tmm_editor",
-        disabled=["cost_per_ton"],
+        disabled=["total_cost", "cost_per_ton"],
+        column_order=["year", "month", "tons", "total_cost", "cost_per_ton"],
     )
 
     col_s1, col_s2 = st.columns([1, 5])
@@ -652,63 +701,51 @@ elif page == "⛏️ TMM Tracker":
         if st.button("💾 Save Changes", key="save_tmm"):
             save_cols = [c for c in TMM_COLS if c in edited_tmm.columns]
             clean_tmm = edited_tmm[save_cols].copy()
-            clean_tmm["tons"]       = pd.to_numeric(clean_tmm["tons"],       errors="coerce").fillna(0)
-            clean_tmm["total_cost"] = pd.to_numeric(clean_tmm["total_cost"], errors="coerce").fillna(0)
+            clean_tmm["tons"] = pd.to_numeric(clean_tmm["tons"], errors="coerce").fillna(0)
+            clean_tmm["year"] = pd.to_numeric(clean_tmm["year"], errors="coerce").fillna(0)
             save_tmm(clean_tmm)
             st.session_state["tmm"] = clean_tmm
             st.success(f"Saved {len(clean_tmm):,} TMM rows.")
             st.rerun()
     with col_s2:
-        tot_tons = pd.to_numeric(edited_tmm["tons"],       errors="coerce").sum()
-        tot_cost = pd.to_numeric(edited_tmm["total_cost"], errors="coerce").sum()
+        tot_tons = pd.to_numeric(edited_tmm["tons"], errors="coerce").sum()
+        tot_cost = display_tmm["total_cost"].sum()
         avg_cpt  = (tot_cost / tot_tons) if tot_tons > 0 else 0
+        sap_note = " (from SAP)" if sap_loaded else " (upload SAP to populate)"
         st.markdown(
             f"**Total Tons:** {tot_tons:,.0f} t &nbsp;|&nbsp; "
-            f"**Total Cost:** {_fmt_dollar(tot_cost)} &nbsp;|&nbsp; "
+            f"**SAP Cost:** {_fmt_dollar(tot_cost)}{sap_note} &nbsp;|&nbsp; "
             f"**Avg Cost/Ton:** ${avg_cpt:,.2f}",
             unsafe_allow_html=True,
         )
 
-    # Link to contract tracker totals
-    st.divider()
-    st.markdown("### 💡 Use Contract Tracker Total as Cost Basis")
-    c_total_spent = pd.to_numeric(contracts()["amount_spent"], errors="coerce").sum()
-    st.info(
-        f"Your Contract Tracker shows **{_fmt_dollar(c_total_spent)}** total amount spent. "
-        f"With **{tot_tons:,.0f} t** total TMM logged, the implied overall cost per ton is "
-        f"**${c_total_spent/tot_tons:,.2f}/t**."
-        if tot_tons > 0 else
-        f"Your Contract Tracker shows **{_fmt_dollar(c_total_spent)}** total amount spent. "
-        "Add TMM entries above to calculate Cost per Ton."
-    )
-
-    # Chart
+    # Chart — sort by year then month order
     if not display_tmm.empty and display_tmm["tons"].sum() > 0:
         st.divider()
         st.markdown("### Cost per Ton Trend")
-        plot_data = _add_tmm_calcs(
-            edited_tmm[pd.to_numeric(edited_tmm["tons"], errors="coerce") > 0]
+        plot_data = _add_tmm_calcs(tmm())
+        plot_data = plot_data[pd.to_numeric(plot_data["tons"], errors="coerce") > 0].copy()
+        # Sort chronologically
+        plot_data["_mo"] = plot_data["month"].map(_MONTH_ORDER).fillna(0)
+        plot_data = plot_data.sort_values(["year", "_mo"]).drop(columns=["_mo"])
+        plot_data["period_label"] = (
+            plot_data["year"].astype(int).astype(str) + " " + plot_data["month"]
         )
+
         fig = go.Figure()
-        # Stacked bar: cost per ton
         fig.add_trace(go.Bar(
-            x=plot_data["period"],
-            y=plot_data["tons"],
-            name="Tons Moved",
-            marker_color="#1B3A5C",
-            yaxis="y",
+            x=plot_data["period_label"], y=plot_data["tons"],
+            name="Tons Moved", marker_color="#1B3A5C", yaxis="y",
         ))
         fig.add_trace(go.Scatter(
-            x=plot_data["period"],
-            y=plot_data["cost_per_ton"],
-            name="Cost / Ton ($)",
-            mode="lines+markers",
+            x=plot_data["period_label"], y=plot_data["cost_per_ton"],
+            name="Cost / Ton ($)", mode="lines+markers",
             marker=dict(size=8, color="#C9872A"),
             line=dict(color="#C9872A", width=3),
             yaxis="y2",
         ))
         fig.update_layout(
-            yaxis =dict(title="Tons Moved",   tickformat=",.0f", showgrid=True,  gridcolor="#EEE"),
+            yaxis =dict(title="Tons Moved",     tickformat=",.0f",  showgrid=True, gridcolor="#EEE"),
             yaxis2=dict(title="Cost / Ton ($)", tickformat="$,.2f", overlaying="y", side="right"),
             legend=dict(orientation="h", y=1.05),
             height=350, margin=dict(l=0, r=10, t=20, b=10),
@@ -884,6 +921,7 @@ elif page == "📤 Export":
             if t_calc.empty:
                 st.warning("No TMM data to export.")
             else:
+                t_calc["year"] = t_calc["year"].astype(int)
                 csv = t_calc.to_csv(index=False)
                 st.download_button("⬇️ Download CSV", data=csv,
                                    file_name="MineDept_TMM_Tracker.csv",

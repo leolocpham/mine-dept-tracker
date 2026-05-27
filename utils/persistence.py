@@ -35,11 +35,9 @@ CONTRACT_COLS: dict[str, type] = {
 }
 
 TMM_COLS: dict[str, type] = {
-    "period":     str,
-    "area":       str,
-    "tons":       float,
-    "total_cost": float,
-    "notes":      str,
+    "year":  float,   # stored as float for JSON round-trip; displayed as int
+    "month": str,
+    "tons":  float,
 }
 
 
