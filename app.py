@@ -588,15 +588,15 @@ elif page == "📈 Executive Summary":
     k1, k2, k3, k4 = st.columns(4)
     k1.metric(f"Actual — {sel_mo[:3]} {sel_yr}", _fmt_dollar(curr_actual))
     if hp:
-        k2.metric("Plan", _fmt_dollar(curr_plan))
+        k2.metric("Budget", _fmt_dollar(curr_plan))
         k3.metric(
-            "Variance vs Plan", _fmt_dollar(curr_var),
+            "Variance vs Budget", _fmt_dollar(curr_var),
             delta=f"{curr_vp:+.1f}%",
             delta_color="normal" if curr_var >= 0 else "inverse",
-            help="Positive = under plan (good). Negative = over plan.",
+            help="Positive = under budget (good). Negative = over budget.",
         )
     else:
-        k2.metric("Plan", "N/A — upload cost element file")
+        k2.metric("Budget", "N/A — upload cost element file")
         k3.metric("Variance", "N/A")
     if prior_actual:
         k4.metric(
@@ -611,13 +611,108 @@ elif page == "📈 Executive Summary":
     if hp:
         y1, y2, y3, y4 = st.columns(4)
         y1.metric(f"YTD Actual ({sel_yr})", _fmt_dollar(ytd_actual))
-        y2.metric("YTD Plan",               _fmt_dollar(ytd_plan))
+        y2.metric("YTD Budget",             _fmt_dollar(ytd_plan))
         y3.metric(
             "YTD Variance", _fmt_dollar(ytd_var),
             delta=f"{ytd_vp:+.1f}%",
             delta_color="normal" if ytd_var >= 0 else "inverse",
         )
         y4.metric("Months in YTD", str(mo_count))
+
+    # ── Expiring contracts ────────────────────────────────────────────────────
+    cont_all = contracts()
+    if "expiry_date" in cont_all.columns:
+        _exp = cont_all[
+            cont_all["expiry_date"].notna() &
+            (cont_all["expiry_date"].astype(str).str.strip() != "")
+        ].copy()
+        if not _exp.empty:
+            _exp["_expdt"] = pd.to_datetime(_exp["expiry_date"], errors="coerce")
+            _exp = _exp[_exp["_expdt"].notna()].sort_values("_expdt")
+            if not _exp.empty:
+                today = pd.Timestamp.today().normalize()
+                _exp["Days Left"] = (_exp["_expdt"] - today).dt.days
+                def _exp_flag(d):
+                    if d < 0:    return "🔴 Expired"
+                    if d <= 30:  return "🔴 < 30 days"
+                    if d <= 90:  return "🟡 30–90 days"
+                    return "🟢 > 90 days"
+                _exp["Alert"] = _exp["Days Left"].apply(_exp_flag)
+                _exp["Expiry"] = _exp["_expdt"].dt.strftime("%d %b %Y")
+                _exp["Days Left"] = _exp["Days Left"].apply(
+                    lambda d: f"Expired {abs(d)}d ago" if d < 0 else f"{d} days"
+                )
+                urgent = (_exp["Alert"].str.startswith("🔴")).sum()
+                warn   = (_exp["Alert"].str.startswith("🟡")).sum()
+                st.divider()
+                if urgent:
+                    st.warning(f"⚠️ {urgent} contract(s) expired or expiring within 30 days.")
+                st.markdown("### 📅 Contract Expiry Watch List")
+                st.caption("Sorted earliest to latest. Only contracts with an Expiry Date set are shown.")
+                show_exp = _exp[["vendor", "task", "po_number", "Expiry", "Days Left", "Alert"]].rename(columns={
+                    "vendor":    "Vendor",
+                    "task":      "Task",
+                    "po_number": "PO Number",
+                    "Expiry":    "Expiry Date",
+                    "Alert":     "Status",
+                })
+                st.dataframe(show_exp, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Monthly spend vs budget chart ────────────────────────────────────────
+    if not sap.empty and len(_available_periods(sap)) > 1:
+        st.markdown("### 📊 Monthly Actual Spend vs Budget")
+        st.caption("All periods in the SAP database. Budget = Plan column from your SAP cost element file.")
+        monthly = (
+            sap[sap["date"].notna()].copy()
+            .assign(_yr  =lambda d: d["date"].dt.year,
+                    _mo  =lambda d: d["date"].dt.strftime("%B"),
+                    _mo_n=lambda d: d["date"].dt.month)
+            .groupby(["_yr", "_mo", "_mo_n"], as_index=False)
+            .agg(actual=("amount", "sum"),
+                 budget=("plan",   "sum") if hp else ("amount", "sum"))
+            .sort_values(["_yr", "_mo_n"])
+        )
+        monthly["label"] = monthly["_yr"].astype(int).astype(str) + " " + monthly["_mo"]
+        monthly["over"]  = monthly["actual"] > monthly["budget"] if hp else False
+
+        fig_mb = go.Figure()
+        if hp:
+            fig_mb.add_trace(go.Bar(
+                name="Budget", x=monthly["label"], y=monthly["budget"],
+                marker_color="#1B3A5C", opacity=0.55,
+            ))
+        colors_act = []
+        if hp:
+            colors_act = [
+                "#C62828" if over else "#2E7D32"
+                for over in monthly["over"]
+            ]
+        else:
+            colors_act = ["#C9872A"] * len(monthly)
+        fig_mb.add_trace(go.Bar(
+            name="Actual", x=monthly["label"], y=monthly["actual"],
+            marker_color=colors_act, opacity=0.9,
+        ))
+        if hp:
+            fig_mb.add_trace(go.Scatter(
+                name="Budget Line", x=monthly["label"], y=monthly["budget"],
+                mode="lines", line=dict(color="#1B3A5C", width=2, dash="dot"),
+                showlegend=True,
+            ))
+        fig_mb.update_layout(
+            barmode="overlay", height=340,
+            margin=dict(l=0, r=10, t=10, b=10),
+            yaxis=dict(tickprefix="$", tickformat=",.0f",
+                       showgrid=True, gridcolor="#EEE"),
+            legend=dict(orientation="h", y=1.08),
+            plot_bgcolor="white", paper_bgcolor="white",
+            font=dict(family="Arial", size=12),
+        )
+        if hp:
+            st.caption("Red bars = over budget · Green bars = under budget · Dotted line = monthly budget")
+        st.plotly_chart(fig_mb, use_container_width=True)
 
     st.divider()
 
@@ -661,29 +756,29 @@ elif page == "📈 Executive Summary":
     lines = []
     if hp:
         icon = "✅" if curr_var >= 0 else "⚠️"
-        word = "under plan" if curr_var >= 0 else "over plan"
+        word = "under budget" if curr_var >= 0 else "over budget"
         lines.append(
             f"{icon} **{sel_mo} {sel_yr}:** Total actual spend is "
             f"**{_fmt_dollar(curr_actual)}**, **{abs(curr_vp):.1f}% {word}** "
-            f"(plan: {_fmt_dollar(curr_plan)})."
+            f"(budget: {_fmt_dollar(curr_plan)})."
         )
         lines.append(
             f"**YTD through {sel_mo} {sel_yr}:** {_fmt_dollar(ytd_actual)} actual vs "
-            f"{_fmt_dollar(ytd_plan)} plan — "
-            f"**{abs(ytd_vp):.1f}% {'under' if ytd_var >= 0 else 'over'} plan**."
+            f"{_fmt_dollar(ytd_plan)} budget — "
+            f"**{abs(ytd_vp):.1f}% {'under' if ytd_var >= 0 else 'over'} budget**."
         )
         if not over_plan.empty:
             r = over_plan.iloc[0]
             lines.append(
-                f"🔴 **Biggest over-plan area:** {r['vendor']} "
-                f"({_fmt_dollar(r['actual'])} actual vs {_fmt_dollar(r['plan'])} plan, "
-                f"{abs(r['var_pct']):.1f}% over plan)."
+                f"🔴 **Biggest over-budget area:** {r['vendor']} "
+                f"({_fmt_dollar(r['actual'])} actual vs {_fmt_dollar(r['plan'])} budget, "
+                f"{abs(r['var_pct']):.1f}% over budget)."
             )
         if not under_plan.empty:
             r = under_plan.iloc[0]
             lines.append(
                 f"🟢 **Best performing:** {r['vendor']} "
-                f"({abs(r['var_pct']):.1f}% under plan, "
+                f"({abs(r['var_pct']):.1f}% under budget, "
                 f"{_fmt_dollar(r['variance'])} saving vs budget)."
             )
     else:
@@ -730,7 +825,7 @@ elif page == "📈 Executive Summary":
         fig_main = go.Figure()
         if hp:
             fig_main.add_trace(go.Bar(
-                name="Plan", y=cat_sorted["vendor"], x=cat_sorted["plan"],
+                name="Budget", y=cat_sorted["vendor"], x=cat_sorted["plan"],
                 orientation="h", marker_color="#B0BEC5", opacity=0.85,
             ))
         fig_main.add_trace(go.Bar(
@@ -753,12 +848,12 @@ elif page == "📈 Executive Summary":
         disp = cat_df.sort_values("actual", ascending=False).copy()
         disp["Actual"] = disp["actual"].apply(_fmt_dollar)
         if hp:
-            disp["Plan"]     = disp["plan"].apply(_fmt_dollar)
+            disp["Budget"]   = disp["plan"].apply(_fmt_dollar)
             disp["Variance"] = disp["variance"].apply(
                 lambda v: ("▲ " if v >= 0 else "▼ ") + _fmt_dollar(abs(v))
             )
             disp["Var %"] = disp["var_pct"].apply(lambda v: f"{v:+.1f}%")
-            out_cols = ["vendor", "Actual", "Plan", "Variance", "Var %"]
+            out_cols = ["vendor", "Actual", "Budget", "Variance", "Var %"]
         else:
             out_cols = ["vendor", "Actual"]
         st.dataframe(
@@ -802,7 +897,7 @@ elif page == "📈 Executive Summary":
     # ── Areas of focus ────────────────────────────────────────────────────────
     if hp and not over_plan.empty:
         st.divider()
-        st.markdown("### 🎯 Areas of Focus — Over Plan")
+        st.markdown("### 🎯 Areas of Focus — Over Budget")
         cols = st.columns(min(3, len(over_plan)))
         for i, (_, row) in enumerate(over_plan.head(3).iterrows()):
             with cols[i]:
@@ -811,7 +906,7 @@ elif page == "📈 Executive Summary":
 padding:14px 16px;border-radius:6px;font-family:Arial;font-size:14px;">
 <strong>⚠️ {row['vendor']}</strong><br><br>
 Actual: <strong>{_fmt_dollar(row['actual'])}</strong><br>
-Plan: {_fmt_dollar(row['plan'])}<br>
+Budget: {_fmt_dollar(row['plan'])}<br>
 Over by: <strong style="color:#C62828">{_fmt_dollar(abs(row['variance']))}</strong>
 <span style="color:#C62828"> ({abs(row['var_pct']):.1f}%)</span>
 </div>""", unsafe_allow_html=True)
@@ -827,7 +922,7 @@ Over by: <strong style="color:#C62828">{_fmt_dollar(abs(row['variance']))}</stro
 padding:14px 16px;border-radius:6px;font-family:Arial;font-size:14px;">
 <strong>✅ {row['vendor']}</strong><br><br>
 Actual: <strong>{_fmt_dollar(row['actual'])}</strong><br>
-Plan: {_fmt_dollar(row['plan'])}<br>
+Budget: {_fmt_dollar(row['plan'])}<br>
 Under by: <strong style="color:#2E7D32">{_fmt_dollar(row['variance'])}</strong>
 <span style="color:#2E7D32"> ({abs(row['var_pct']):.1f}%)</span>
 </div>""", unsafe_allow_html=True)
@@ -943,7 +1038,7 @@ elif page == "📊 Dashboard":
             fig_bar = go.Figure()
             if hp:
                 fig_bar.add_trace(go.Bar(
-                    name="Plan", y=cat_df["vendor"], x=cat_df["plan"],
+                    name="Budget", y=cat_df["vendor"], x=cat_df["plan"],
                     orientation="h", marker_color="#B0BEC5", opacity=0.85,
                 ))
             fig_bar.add_trace(go.Bar(
@@ -970,7 +1065,7 @@ elif page == "📊 Dashboard":
     # ── Monthly trend ─────────────────────────────────────────────────────────
     if has_sap and len(_available_periods(sap)) > 1:
         st.divider()
-        st.markdown("### 📈 Monthly Cost Trend — Actual vs Plan")
+        st.markdown("### 📈 Monthly Cost Trend — Actual vs Budget")
         trend = (
             sap[sap["date"].notna()].copy()
             .assign(_yr  =lambda d: d["date"].dt.year,
@@ -985,7 +1080,7 @@ elif page == "📊 Dashboard":
         fig_tr = go.Figure()
         if hp:
             fig_tr.add_trace(go.Bar(
-                name="Plan", x=trend["label"], y=trend["plan"],
+                name="Budget", x=trend["label"], y=trend["plan"],
                 marker_color="#B0BEC5", opacity=0.7,
             ))
         fig_tr.add_trace(go.Scatter(
@@ -1135,6 +1230,9 @@ elif page == "📋 Contract Tracker":
         "task":            st.column_config.TextColumn("Project Task / Description", width=240),
         "pr_number":       st.column_config.TextColumn("PR Number", width=120),
         "po_number":       st.column_config.TextColumn("PO Number", width=120),
+        "expiry_date":     st.column_config.DateColumn(
+                           "Expiry Date", format="YYYY-MM-DD", width=130,
+                           help="Contract end / expiry date"),
         "original_budget": st.column_config.NumberColumn("Original Budget ($)",
                            format="$%.0f", min_value=0, width=150),
         "amount_spent":    st.column_config.NumberColumn("Amount Spent ($)",
@@ -1171,6 +1269,11 @@ elif page == "📋 Contract Tracker":
             clean = edited[save_cols].copy()
             clean["original_budget"] = pd.to_numeric(clean["original_budget"], errors="coerce").fillna(0)
             clean["amount_spent"]    = pd.to_numeric(clean["amount_spent"],    errors="coerce").fillna(0)
+            if "expiry_date" in clean.columns:
+                clean["expiry_date"] = clean["expiry_date"].apply(
+                    lambda v: v.strftime("%Y-%m-%d") if hasattr(v, "strftime") else
+                    (str(v)[:10] if v and str(v) not in ("None", "NaT", "nan") else "")
+                )
             save_contracts(clean)
             st.session_state["contracts"] = clean
             st.success(f"Saved {len(clean):,} contract rows.")

@@ -32,6 +32,7 @@ CONTRACT_COLS: dict[str, type] = {
     "task":            str,
     "pr_number":       str,
     "po_number":       str,
+    "expiry_date":     str,
     "original_budget": float,
     "amount_spent":    float,
     "sap_synced":      bool,
